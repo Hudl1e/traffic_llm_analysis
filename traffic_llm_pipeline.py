@@ -556,9 +556,31 @@ def choose_default_session(session_ids: List[str]) -> str:
     return sorted(session_ids)[-1]
 
 
+def infer_cross_session_mode(question: str) -> Optional[str]:
+    q = question.lower()
+    mentions_session_compare = any(
+        phrase in q for phrase in [
+            "which session",
+            "across sessions",
+            "compare sessions",
+            "among sessions",
+            "all sessions",
+        ]
+    )
+    if not mentions_session_compare:
+        return None
+
+    if any(word in q for word in ["strongest", "highest", "most", "largest", "worst", "max"]):
+        return "strongest"
+    if any(word in q for word in ["weakest", "lowest", "least", "smallest", "best", "min"]):
+        return "weakest"
+    return "rank"
+
+
 def ask_llm_for_plan(question: str, session_summaries: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     available_sessions = sorted(session_summaries.keys())
     default_session = choose_default_session(available_sessions)
+    comparison_mode = infer_cross_session_mode(question)
 
     prompt = f"""
 You are helping analyze wireless trace tables that were already exported from Teledyne LeCroy.
@@ -574,6 +596,7 @@ Rules:
 - Keep the plan simple and executable locally with pandas
 - group_by may be empty or use concrete columns like source_addr, destination_addr, bssid, mac_type, mac_subtype, channel, or UDP ports if present
 - filters should be minimal and safe
+- If the question compares sessions, treat this as a cross-session comparison. Still emit one valid session_id placeholder such as "{default_session}", but use task_type/metrics that support comparing every session locally.
 
 Session summaries:
 {json.dumps(session_summaries, indent=2)}
@@ -595,7 +618,15 @@ User question:
         },
     )
 
-    return json.loads(resp.output_text)
+    plan = json.loads(resp.output_text)
+    if comparison_mode:
+        plan["session_scope"] = "all_sessions"
+        plan["comparison_mode"] = comparison_mode
+        plan["plot"] = "bar"
+    else:
+        plan["session_scope"] = "single_session"
+        plan["comparison_mode"] = "none"
+    return plan
 
 
 # ============================================================
@@ -898,6 +929,106 @@ def run_plan(df: pd.DataFrame, plan: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict
     return result, meta
 
 
+def _safe_max(series: pd.Series) -> float:
+    series = pd.to_numeric(series, errors="coerce")
+    return float(series.max()) if series.notna().any() else float("nan")
+
+
+def _safe_mean(series: pd.Series) -> float:
+    series = pd.to_numeric(series, errors="coerce")
+    return float(series.mean()) if series.notna().any() else float("nan")
+
+
+def summarize_session_result(session_id: str, session_df: pd.DataFrame, plan: Dict[str, Any]) -> Dict[str, Any]:
+    result, meta = run_plan(session_df, plan)
+    task_type = plan["task_type"]
+
+    ts = session_df["timestamp"] if "timestamp" in session_df.columns else pd.Series(dtype="datetime64[ns]")
+    session_duration_s = (
+        float((ts.max() - ts.min()).total_seconds())
+        if not ts.empty and ts.notna().any()
+        else float("nan")
+    )
+
+    summary: Dict[str, Any] = {
+        "session_id": session_id,
+        "task_type": task_type,
+        "rows_after_filter": meta["rows_after_filter"],
+        "result_rows": meta["result_rows"],
+        "session_duration_s": session_duration_s,
+    }
+
+    if task_type == "burst_detection":
+        summary.update({
+            "comparison_score": _safe_max(result["burst_z"]) if "burst_z" in result.columns else float("nan"),
+            "peak_burst_z": _safe_max(result["burst_z"]) if "burst_z" in result.columns else float("nan"),
+            "peak_packets_per_s": _safe_max(result["packets_per_s"]) if "packets_per_s" in result.columns else float("nan"),
+            "burst_bucket_count": int(result["is_burst"].fillna(False).sum()) if "is_burst" in result.columns else 0,
+            "burst_bucket_fraction": float(result["is_burst"].fillna(False).mean()) if "is_burst" in result.columns and len(result) else 0.0,
+            "mean_bad_fcs_rate": _safe_mean(result["bad_fcs_rate"]) if "bad_fcs_rate" in result.columns else float("nan"),
+            "mean_retry_rate": _safe_mean(result["retry_rate"]) if "retry_rate" in result.columns else float("nan"),
+        })
+    elif task_type == "delay_jitter_analysis":
+        summary.update({
+            "comparison_score": _safe_max(result["jitter_score"]) if "jitter_score" in result.columns else float("nan"),
+            "peak_jitter_score": _safe_max(result["jitter_score"]) if "jitter_score" in result.columns else float("nan"),
+            "peak_p95_iat": _safe_max(result["p95_iat"]) if "p95_iat" in result.columns else float("nan"),
+            "peak_mean_iat": _safe_max(result["mean_iat"]) if "mean_iat" in result.columns else float("nan"),
+            "mean_bad_fcs_rate": _safe_mean(result["bad_fcs_rate"]) if "bad_fcs_rate" in result.columns else float("nan"),
+            "mean_retry_rate": _safe_mean(result["retry_rate"]) if "retry_rate" in result.columns else float("nan"),
+        })
+    elif task_type == "error_spike_analysis":
+        summary.update({
+            "comparison_score": _safe_max(result["error_z"]) if "error_z" in result.columns else float("nan"),
+            "peak_error_z": _safe_max(result["error_z"]) if "error_z" in result.columns else float("nan"),
+            "peak_error_frame_rate": _safe_max(result["error_frame_rate"]) if "error_frame_rate" in result.columns else float("nan"),
+            "peak_bad_fcs_rate": _safe_max(result["bad_fcs_rate"]) if "bad_fcs_rate" in result.columns else float("nan"),
+            "peak_retry_rate": _safe_max(result["retry_rate"]) if "retry_rate" in result.columns else float("nan"),
+            "error_spike_bucket_count": int(result["is_error_spike"].fillna(False).sum()) if "is_error_spike" in result.columns else 0,
+        })
+    else:
+        sort_col = "packet_count" if "packet_count" in result.columns else result.columns[-1]
+        summary.update({
+            "comparison_score": _safe_max(result[sort_col]),
+            "primary_metric": sort_col,
+        })
+
+    return summary
+
+
+def compare_sessions(sessions: Dict[str, pd.DataFrame], plan: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    rows = [summarize_session_result(session_id, df, plan) for session_id, df in sessions.items()]
+    out = pd.DataFrame(rows)
+
+    mode = plan.get("comparison_mode", "rank")
+    ascending = mode == "weakest"
+
+    tie_breakers = [c for c in [
+        "comparison_score",
+        "burst_bucket_fraction",
+        "burst_bucket_count",
+        "peak_packets_per_s",
+        "peak_p95_iat",
+        "peak_error_frame_rate",
+        "rows_after_filter",
+    ] if c in out.columns]
+    if not tie_breakers:
+        raise ValueError("No comparison columns available for cross-session ranking.")
+
+    sort_ascending = [ascending] + [ascending] * (len(tie_breakers) - 1)
+    out = out.sort_values(tie_breakers, ascending=sort_ascending, na_position="last").reset_index(drop=True)
+
+    rank_col = "weakest_rank" if ascending else "strongest_rank"
+    out.insert(0, rank_col, range(1, len(out) + 1))
+
+    meta = {
+        "session_scope": "all_sessions",
+        "comparison_mode": mode,
+        "sessions_compared": int(len(out)),
+    }
+    return out, meta
+
+
 # ============================================================
 # Plotting
 # ============================================================
@@ -928,9 +1059,9 @@ def save_plot(result: pd.DataFrame, plan: Dict[str, Any], out_prefix: Path) -> O
         plt.title(plan["question_rephrased"])
 
     elif plot_kind == "bar":
-        x_col = result.columns[0]
+        x_col = "session_id" if "session_id" in result.columns else result.columns[0]
         y_candidates = [c for c in [
-            "packet_count", "bytes_sum", "error_frame_count", "bad_fcs_count",
+            "comparison_score", "packet_count", "bytes_sum", "error_frame_count", "bad_fcs_count",
             "retry_count", "bad_fcs_rate", "error_frame_rate", "retry_rate"
         ] if c in result.columns]
         if not y_candidates:
@@ -991,6 +1122,7 @@ Write:
 3. If anomalies appear, add a compact incident-style explanation with likely causes
 4. Do not invent fields that are not present
 5. Keep it under 250 words
+6. If this is a cross-session comparison, explicitly name the top-ranked session and mention the comparison_score basis from the result rows
 """.strip()
 
     resp = get_openai_client().responses.create(
@@ -1041,14 +1173,21 @@ def main():
 
     if args.session:
         plan["session_id"] = args.session
+        plan["session_scope"] = "single_session"
+        plan["comparison_mode"] = "none"
 
-    session_id = plan["session_id"]
-    if session_id not in sessions:
-        raise ValueError(f"LLM selected unknown session_id={session_id}. Available: {sorted(sessions.keys())}")
+    if plan.get("session_scope") == "all_sessions" and not args.session:
+        plan["session_id"] = "ALL_SESSIONS"
+        result, meta = compare_sessions(sessions, plan)
+        stem_base = "all_sessions"
+    else:
+        session_id = plan["session_id"]
+        if session_id not in sessions:
+            raise ValueError(f"LLM selected unknown session_id={session_id}. Available: {sorted(sessions.keys())}")
+        result, meta = run_plan(sessions[session_id], plan)
+        stem_base = session_id
 
-    result, meta = run_plan(sessions[session_id], plan)
-
-    stem = re.sub(r"[^\w\-]+", "_", f"{session_id}_{plan['task_type']}")
+    stem = re.sub(r"[^\w\-]+", "_", f"{stem_base}_{plan['task_type']}")
     out_prefix = out_dir / stem
 
     plot_path = save_plot(result, plan, out_prefix)

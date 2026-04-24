@@ -577,6 +577,40 @@ def infer_cross_session_mode(question: str) -> Optional[str]:
     return "rank"
 
 
+def infer_comparison_metric(question: str, task_type: Optional[str] = None) -> Optional[str]:
+    q = question.lower()
+
+    avg_packet_size_phrases = [
+        "average packet size",
+        "avg packet size",
+        "mean packet size",
+        "average frame size",
+        "avg frame size",
+        "mean frame size",
+    ]
+    if any(phrase in q for phrase in avg_packet_size_phrases):
+        return "avg_packet_size"
+
+    if any(phrase in q for phrase in ["packets per second", "packet rate", "pps"]):
+        return "packets_per_second"
+
+    if any(phrase in q for phrase in ["bytes per second", "byte rate"]):
+        return "bytes_per_second"
+
+    if "bad fcs rate" in q or "fcs rate" in q:
+        return "bad_fcs_rate"
+
+    if "jitter score" in q:
+        return "jitter_score"
+
+    task_defaults = {
+        "burst_detection": "peak_burst_z",
+        "delay_jitter_analysis": "jitter_score",
+        "error_spike_analysis": "peak_error_z",
+    }
+    return task_defaults.get(task_type or "")
+
+
 def ask_llm_for_plan(question: str, session_summaries: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     available_sessions = sorted(session_summaries.keys())
     default_session = choose_default_session(available_sessions)
@@ -622,10 +656,12 @@ User question:
     if comparison_mode:
         plan["session_scope"] = "all_sessions"
         plan["comparison_mode"] = comparison_mode
+        plan["comparison_metric"] = infer_comparison_metric(question, plan.get("task_type"))
         plan["plot"] = "bar"
     else:
         plan["session_scope"] = "single_session"
         plan["comparison_mode"] = "none"
+        plan["comparison_metric"] = None
     return plan
 
 
@@ -939,14 +975,70 @@ def _safe_mean(series: pd.Series) -> float:
     return float(series.mean()) if series.notna().any() else float("nan")
 
 
+def _safe_sum(series: pd.Series) -> float:
+    series = pd.to_numeric(series, errors="coerce")
+    return float(series.sum()) if series.notna().any() else float("nan")
+
+
+def _divide_or_nan(numerator: Any, denominator: Any) -> float:
+    try:
+        num = float(numerator)
+        den = float(denominator)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not math.isfinite(num) or not math.isfinite(den) or den == 0:
+        return float("nan")
+    return num / den
+
+
+def choose_comparison_metric(plan: Dict[str, Any], summary: Dict[str, Any]) -> str:
+    requested = plan.get("comparison_metric")
+    if requested in summary and pd.notna(summary[requested]):
+        return requested
+
+    fallbacks = [
+        infer_comparison_metric(plan.get("question_rephrased", ""), plan.get("task_type")),
+        "comparison_score",
+        "avg_packet_size",
+        "packets_per_second",
+        "bytes_per_second",
+        "bad_fcs_rate",
+        "jitter_score",
+        "peak_burst_z",
+        "peak_error_z",
+        "packet_count",
+        "bytes_sum",
+    ]
+    for metric in fallbacks:
+        if metric in summary and pd.notna(summary[metric]):
+            return metric
+    return "comparison_score"
+
+
 def summarize_session_result(session_id: str, session_df: pd.DataFrame, plan: Dict[str, Any]) -> Dict[str, Any]:
+    filtered_df = apply_filters(session_df, plan["filters"])
     result, meta = run_plan(session_df, plan)
     task_type = plan["task_type"]
 
-    ts = session_df["timestamp"] if "timestamp" in session_df.columns else pd.Series(dtype="datetime64[ns]")
+    ts = filtered_df["timestamp"] if "timestamp" in filtered_df.columns else pd.Series(dtype="datetime64[ns]")
     session_duration_s = (
         float((ts.max() - ts.min()).total_seconds())
         if not ts.empty and ts.notna().any()
+        else float("nan")
+    )
+    packet_count = int(filtered_df["frame_num"].count()) if "frame_num" in filtered_df.columns else int(meta["rows_after_filter"])
+    bytes_sum = _safe_sum(filtered_df["frame_size_bytes"]) if "frame_size_bytes" in filtered_df.columns else float("nan")
+    avg_packet_size = _divide_or_nan(bytes_sum, packet_count)
+    packets_per_second = _divide_or_nan(packet_count, session_duration_s)
+    bytes_per_second = _divide_or_nan(bytes_sum, session_duration_s)
+    bad_fcs_rate = (
+        float(filtered_df["bad_fcs_flag"].fillna(False).mean())
+        if "bad_fcs_flag" in filtered_df.columns and len(filtered_df)
+        else float("nan")
+    )
+    retry_rate = (
+        float(filtered_df["retry_flag"].fillna(False).mean())
+        if "retry_flag" in filtered_df.columns and len(filtered_df)
         else float("nan")
     )
 
@@ -956,11 +1048,17 @@ def summarize_session_result(session_id: str, session_df: pd.DataFrame, plan: Di
         "rows_after_filter": meta["rows_after_filter"],
         "result_rows": meta["result_rows"],
         "session_duration_s": session_duration_s,
+        "packet_count": packet_count,
+        "bytes_sum": bytes_sum,
+        "avg_packet_size": avg_packet_size,
+        "packets_per_second": packets_per_second,
+        "bytes_per_second": bytes_per_second,
+        "bad_fcs_rate": bad_fcs_rate,
+        "retry_rate": retry_rate,
     }
 
     if task_type == "burst_detection":
         summary.update({
-            "comparison_score": _safe_max(result["burst_z"]) if "burst_z" in result.columns else float("nan"),
             "peak_burst_z": _safe_max(result["burst_z"]) if "burst_z" in result.columns else float("nan"),
             "peak_packets_per_s": _safe_max(result["packets_per_s"]) if "packets_per_s" in result.columns else float("nan"),
             "burst_bucket_count": int(result["is_burst"].fillna(False).sum()) if "is_burst" in result.columns else 0,
@@ -968,30 +1066,42 @@ def summarize_session_result(session_id: str, session_df: pd.DataFrame, plan: Di
             "mean_bad_fcs_rate": _safe_mean(result["bad_fcs_rate"]) if "bad_fcs_rate" in result.columns else float("nan"),
             "mean_retry_rate": _safe_mean(result["retry_rate"]) if "retry_rate" in result.columns else float("nan"),
         })
+        summary["jitter_score"] = float("nan")
+        summary["peak_error_z"] = float("nan")
     elif task_type == "delay_jitter_analysis":
         summary.update({
-            "comparison_score": _safe_max(result["jitter_score"]) if "jitter_score" in result.columns else float("nan"),
             "peak_jitter_score": _safe_max(result["jitter_score"]) if "jitter_score" in result.columns else float("nan"),
             "peak_p95_iat": _safe_max(result["p95_iat"]) if "p95_iat" in result.columns else float("nan"),
             "peak_mean_iat": _safe_max(result["mean_iat"]) if "mean_iat" in result.columns else float("nan"),
             "mean_bad_fcs_rate": _safe_mean(result["bad_fcs_rate"]) if "bad_fcs_rate" in result.columns else float("nan"),
             "mean_retry_rate": _safe_mean(result["retry_rate"]) if "retry_rate" in result.columns else float("nan"),
         })
+        summary["jitter_score"] = summary["peak_jitter_score"]
+        summary["peak_burst_z"] = float("nan")
+        summary["peak_error_z"] = float("nan")
     elif task_type == "error_spike_analysis":
         summary.update({
-            "comparison_score": _safe_max(result["error_z"]) if "error_z" in result.columns else float("nan"),
             "peak_error_z": _safe_max(result["error_z"]) if "error_z" in result.columns else float("nan"),
             "peak_error_frame_rate": _safe_max(result["error_frame_rate"]) if "error_frame_rate" in result.columns else float("nan"),
             "peak_bad_fcs_rate": _safe_max(result["bad_fcs_rate"]) if "bad_fcs_rate" in result.columns else float("nan"),
             "peak_retry_rate": _safe_max(result["retry_rate"]) if "retry_rate" in result.columns else float("nan"),
             "error_spike_bucket_count": int(result["is_error_spike"].fillna(False).sum()) if "is_error_spike" in result.columns else 0,
         })
+        summary["jitter_score"] = float("nan")
+        summary["peak_burst_z"] = float("nan")
     else:
-        sort_col = "packet_count" if "packet_count" in result.columns else result.columns[-1]
-        summary.update({
-            "comparison_score": _safe_max(result[sort_col]),
-            "primary_metric": sort_col,
-        })
+        if "packet_count" in result.columns:
+            summary["packet_count"] = _safe_sum(result["packet_count"])
+            summary["avg_packet_size"] = _divide_or_nan(summary["bytes_sum"], summary["packet_count"])
+            summary["packets_per_second"] = _divide_or_nan(summary["packet_count"], session_duration_s)
+        if "bytes_sum" in result.columns:
+            summary["bytes_sum"] = _safe_sum(result["bytes_sum"])
+            summary["avg_packet_size"] = _divide_or_nan(summary["bytes_sum"], summary["packet_count"])
+            summary["bytes_per_second"] = _divide_or_nan(summary["bytes_sum"], session_duration_s)
+
+    primary_metric = choose_comparison_metric(plan, summary)
+    summary["primary_metric"] = primary_metric
+    summary["comparison_score"] = summary.get(primary_metric, float("nan"))
 
     return summary
 
@@ -1021,10 +1131,28 @@ def compare_sessions(sessions: Dict[str, pd.DataFrame], plan: Dict[str, Any]) ->
     rank_col = "weakest_rank" if ascending else "strongest_rank"
     out.insert(0, rank_col, range(1, len(out) + 1))
 
+    preferred_order = [
+        rank_col,
+        "session_id",
+        "packet_count",
+        "bytes_sum",
+        "avg_packet_size",
+        "packets_per_second",
+        "bytes_per_second",
+        "bad_fcs_rate",
+        "retry_rate",
+        "comparison_score",
+        "primary_metric",
+    ]
+    ordered_cols = [c for c in preferred_order if c in out.columns]
+    remaining_cols = [c for c in out.columns if c not in ordered_cols]
+    out = out[ordered_cols + remaining_cols]
+
     meta = {
         "session_scope": "all_sessions",
         "comparison_mode": mode,
         "sessions_compared": int(len(out)),
+        "comparison_metric": out["primary_metric"].iloc[0] if "primary_metric" in out.columns and not out.empty else None,
     }
     return out, meta
 
@@ -1061,7 +1189,8 @@ def save_plot(result: pd.DataFrame, plan: Dict[str, Any], out_prefix: Path) -> O
     elif plot_kind == "bar":
         x_col = "session_id" if "session_id" in result.columns else result.columns[0]
         y_candidates = [c for c in [
-            "comparison_score", "packet_count", "bytes_sum", "error_frame_count", "bad_fcs_count",
+            "comparison_score", "avg_packet_size", "packets_per_second", "bytes_per_second",
+            "packet_count", "bytes_sum", "error_frame_count", "bad_fcs_count",
             "retry_count", "bad_fcs_rate", "error_frame_rate", "retry_rate"
         ] if c in result.columns]
         if not y_candidates:

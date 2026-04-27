@@ -1,0 +1,1064 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TraceLens — AI-powered wireless trace analysis</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+  <style>
+    /* ─── Design tokens ─────────────────────────────────────── */
+    :root {
+      --bg: #07080d;
+      --surface: #0d0f18;
+      --surface2: #13162200;
+      --border: #1e2235;
+      --border-glow: #2a6fff33;
+      --primary: #2a6fff;
+      --primary-dim: #2a6fff22;
+      --accent: #00e5c0;
+      --accent-dim: #00e5c011;
+      --muted: #4a5070;
+      --text: #d4d8f0;
+      --text-dim: #6b7490;
+      --danger: #ff4b6e;
+      --danger-dim: #ff4b6e18;
+      --font-display: 'Syne', sans-serif;
+      --font-mono: 'Space Mono', monospace;
+      --radius: 12px;
+      --radius-sm: 8px;
+      --glow-primary: 0 0 24px #2a6fff30, 0 0 48px #2a6fff12;
+      --glow-accent: 0 0 20px #00e5c030;
+    }
+
+    /* ─── Reset & Base ──────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-display);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* Noise grain overlay */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.04'/%3E%3C/svg%3E");
+      pointer-events: none;
+      z-index: 0;
+      opacity: 0.6;
+    }
+
+    /* Ambient glow blobs */
+    .ambient {
+      position: fixed;
+      border-radius: 50%;
+      filter: blur(120px);
+      pointer-events: none;
+      z-index: 0;
+    }
+    .ambient-1 {
+      width: 600px; height: 400px;
+      top: -150px; left: -100px;
+      background: radial-gradient(ellipse, #2a6fff0d 0%, transparent 70%);
+    }
+    .ambient-2 {
+      width: 500px; height: 350px;
+      bottom: 100px; right: -80px;
+      background: radial-gradient(ellipse, #00e5c008 0%, transparent 70%);
+    }
+
+    /* ─── Layout ────────────────────────────────────────────── */
+    .container {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 24px;
+      position: relative;
+      z-index: 1;
+    }
+
+    /* ─── Header ────────────────────────────────────────────── */
+    header {
+      border-bottom: 1px solid var(--border);
+      background: #07080dee;
+      backdrop-filter: blur(16px);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 24px;
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .logo-icon {
+      width: 36px; height: 36px;
+      border-radius: 9px;
+      background: var(--primary-dim);
+      border: 1px solid var(--primary)44;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: var(--glow-primary);
+    }
+    .logo-icon svg { width: 18px; height: 18px; color: var(--primary); }
+    .logo-text h1 {
+      font-size: 18px;
+      font-weight: 800;
+      letter-spacing: -0.3px;
+      background: linear-gradient(135deg, #fff 60%, var(--primary));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .logo-text p {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin-top: 1px;
+    }
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 12px;
+      border-radius: 100px;
+      border: 1px solid var(--border);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-dim);
+      background: var(--surface);
+    }
+    .badge svg { width: 12px; height: 12px; }
+    .btn-ghost {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      border-radius: var(--radius-sm);
+      padding: 6px 10px;
+      cursor: pointer;
+      transition: all 0.2s;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--font-display);
+      font-size: 13px;
+    }
+    .btn-ghost:hover { border-color: var(--danger); color: var(--danger); }
+    .btn-ghost svg { width: 14px; height: 14px; }
+
+    /* ─── Main ──────────────────────────────────────────────── */
+    main { padding: 48px 0 80px; position: relative; z-index: 1; }
+
+    /* ─── Hero (empty state) ────────────────────────────────── */
+    .hero { text-align: center; margin-bottom: 48px; }
+    .hero h2 {
+      font-size: clamp(32px, 5vw, 52px);
+      font-weight: 800;
+      line-height: 1.1;
+      letter-spacing: -1px;
+    }
+    .hero h2 .primary { color: var(--primary); text-shadow: 0 0 40px #2a6fff50; }
+    .hero h2 .accent  { color: var(--accent); }
+    .hero p {
+      margin: 16px auto 0;
+      max-width: 580px;
+      font-size: 14px;
+      color: var(--text-dim);
+      line-height: 1.7;
+    }
+
+    /* ─── Dropzone ──────────────────────────────────────────── */
+    .dropzone {
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 56px 32px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.25s;
+      position: relative;
+      overflow: hidden;
+    }
+    .dropzone::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(ellipse at 50% 120%, #2a6fff06 0%, transparent 60%);
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+    .dropzone:hover, .dropzone.drag-over {
+      border-color: var(--primary)88;
+      background: var(--primary-dim);
+    }
+    .dropzone:hover::before, .dropzone.drag-over::before { opacity: 1; }
+    .dropzone.drag-over { border-style: solid; box-shadow: var(--glow-primary); }
+    .dropzone-icon {
+      width: 64px; height: 64px;
+      margin: 0 auto 16px;
+      border-radius: 50%;
+      background: var(--primary-dim);
+      border: 1px solid var(--primary)33;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: transform 0.3s;
+    }
+    .dropzone:hover .dropzone-icon { transform: scale(1.08); }
+    .dropzone-icon svg { width: 28px; height: 28px; color: var(--primary); }
+    .dropzone p.main-text {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 8px;
+    }
+    .dropzone p.sub-text {
+      font-size: 12px;
+      color: var(--text-dim);
+      font-family: var(--font-mono);
+      line-height: 1.6;
+    }
+    .dropzone p.sub-text code {
+      color: var(--primary);
+      background: var(--primary-dim);
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
+    #file-input { display: none; }
+
+    /* Spinner in dropzone */
+    .spin {
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .progress-text {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--primary);
+      margin-top: 10px;
+    }
+
+    /* ─── Feature cards ──────────────────────────────────────── */
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+      margin-top: 40px;
+    }
+    .feature-card {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      background: var(--surface);
+      transition: border-color 0.2s;
+    }
+    .feature-card:hover { border-color: var(--border-glow); }
+    .feature-card svg { width: 18px; height: 18px; margin-bottom: 10px; }
+    .feature-card h3 { font-size: 13px; font-weight: 700; margin-bottom: 6px; }
+    .feature-card p { font-size: 12px; color: var(--text-dim); line-height: 1.6; }
+
+    /* ─── Loaded state ──────────────────────────────────────── */
+    #loaded-view { display: none; }
+
+    /* Session pills */
+    .session-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 24px;
+    }
+    .session-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 12px;
+      border-radius: 100px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text);
+    }
+    .session-pill span.count { color: var(--text-dim); }
+
+    /* Question card */
+    .question-card {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      background: var(--surface);
+      backdrop-filter: blur(8px);
+      margin-bottom: 24px;
+    }
+    .question-label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.15em;
+      color: var(--text-dim);
+      margin-bottom: 12px;
+    }
+    .question-label svg { width: 12px; height: 12px; color: var(--primary); }
+    textarea#question-input {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text);
+      font-family: var(--font-display);
+      font-size: 14px;
+      padding: 12px 14px;
+      resize: none;
+      outline: none;
+      min-height: 80px;
+      transition: border-color 0.2s;
+    }
+    textarea#question-input:focus { border-color: var(--primary)66; }
+    textarea#question-input::placeholder { color: var(--text-dim); }
+    .question-footer {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .sample-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .chip {
+      padding: 5px 12px;
+      border-radius: 100px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      font-size: 11px;
+      color: var(--text-dim);
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .chip:hover { border-color: var(--primary)66; color: var(--primary); }
+    .btn-primary {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 20px;
+      border-radius: var(--radius-sm);
+      background: var(--primary);
+      color: #fff;
+      font-family: var(--font-display);
+      font-weight: 700;
+      font-size: 13px;
+      border: none;
+      cursor: pointer;
+      transition: all 0.2s;
+      box-shadow: 0 4px 16px #2a6fff30;
+    }
+    .btn-primary:hover { background: #4a82ff; box-shadow: 0 4px 24px #2a6fff50; }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary svg { width: 14px; height: 14px; }
+
+    /* Error banner */
+    .error-banner {
+      display: none;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 12px 16px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--danger)44;
+      background: var(--danger-dim);
+      color: var(--danger);
+      font-size: 13px;
+      margin-bottom: 20px;
+    }
+    .error-banner svg { width: 16px; height: 16px; flex-shrink: 0; margin-top: 1px; }
+    .error-banner.visible { display: flex; }
+
+    /* ─── Results ────────────────────────────────────────────── */
+    #results { display: none; }
+
+    .result-section {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      background: var(--surface);
+      margin-bottom: 16px;
+      animation: fadeUp 0.35s ease forwards;
+    }
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(12px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .section-header svg { width: 16px; height: 16px; color: var(--primary); }
+    .section-header h3 { font-size: 13px; font-weight: 700; }
+
+    /* Plan chips */
+    .plan-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+    .plan-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      font-family: var(--font-mono);
+      font-size: 11px;
+    }
+    .plan-chip .label { color: var(--text-dim); }
+    .plan-chip .value { color: var(--primary); }
+
+    /* Chart */
+    .chart-title {
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 20px;
+      color: var(--text);
+    }
+    .chart-container { position: relative; height: 280px; }
+
+    /* Narrative */
+    .narrative-section {
+      border-color: var(--primary)22;
+      background: #0d0f18;
+    }
+    .narrative-section .section-header svg { color: var(--accent); }
+    .narrative-body {
+      font-size: 13px;
+      line-height: 1.75;
+      color: var(--text);
+    }
+    .narrative-body p { margin-bottom: 10px; }
+    .narrative-body strong { color: var(--accent); }
+    .narrative-body ul, .narrative-body ol { padding-left: 18px; margin-bottom: 10px; }
+    .narrative-body li { margin-bottom: 4px; }
+    .narrating-pulse {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-dim);
+      font-family: var(--font-mono);
+    }
+    .pulse-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--primary);
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50%       { opacity: 0.4; transform: scale(0.7); }
+    }
+
+    /* Table */
+    .table-wrap {
+      overflow-x: auto;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--font-mono);
+      font-size: 11px;
+    }
+    thead th {
+      background: #0d0f18;
+      color: var(--text-dim);
+      font-weight: 700;
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    tbody tr {
+      border-bottom: 1px solid var(--border)66;
+      transition: background 0.15s;
+    }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: var(--primary-dim); }
+    tbody td {
+      padding: 8px 12px;
+      color: var(--text);
+      white-space: nowrap;
+      max-width: 200px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .td-number { color: var(--accent); }
+    .td-true  { color: #4ade80; }
+    .td-false { color: var(--text-dim); }
+    .td-burst { background: #2a6fff12; }
+    .td-spike { background: var(--danger-dim); }
+
+    /* Footer */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 24px;
+      text-align: center;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      position: relative;
+      z-index: 1;
+    }
+
+    /* Thinking overlay on button */
+    .spinner-icon {
+      animation: spin 0.8s linear infinite;
+    }
+
+    /* Responsive */
+    @media (max-width: 600px) {
+      .header-inner { padding: 12px 16px; }
+      main { padding: 28px 0 60px; }
+      .feature-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="ambient ambient-1"></div>
+<div class="ambient ambient-2"></div>
+
+<!-- ─── Header ─────────────────────────────────────── -->
+<header>
+  <div class="header-inner">
+    <div class="logo">
+      <div class="logo-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+        </svg>
+      </div>
+      <div class="logo-text">
+        <h1>TraceLens</h1>
+        <p>wireless trace · ai analysis</p>
+      </div>
+    </div>
+    <div class="header-actions" id="header-actions" style="display:none;">
+      <div class="badge" id="session-badge">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+        <span id="session-badge-text"></span>
+      </div>
+      <button class="btn-ghost" id="clear-btn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+        Clear
+      </button>
+    </div>
+  </div>
+</header>
+
+<!-- ─── Main ───────────────────────────────────────── -->
+<main>
+  <div class="container">
+
+    <!-- Empty / upload state -->
+    <div id="upload-view">
+      <div class="hero">
+        <h2>Ask <span class="primary">anything</span> about<br>your <span class="accent">wireless traces</span></h2>
+        <p>Drop a ZIP of Teledyne LeCroy sessions. TraceLens parses, merges, and analyzes tap / mac / error / udp tables, then turns natural-language questions into burst, jitter, error, and cross-session insights.</p>
+      </div>
+
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="file-input" accept=".zip">
+        <div class="dropzone-icon" id="dz-icon">
+          <svg id="dz-svg-upload" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/>
+            <path d="M20.39 18.39A5 5 0 0018 9h-1.26A8 8 0 103 16.3"/>
+          </svg>
+          <svg id="dz-svg-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="spin" style="display:none;">
+            <path d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" stroke-dasharray="56" stroke-dashoffset="28"/>
+          </svg>
+        </div>
+        <p class="main-text" id="dz-main-text">Drop a session ZIP or click to browse</p>
+        <p class="sub-text">Expects folders like <code>02_04_1/</code> containing <code>*_tap.csv</code>, <code>*_mac.csv</code>, <code>*_error.csv</code>, <code>*_udp.csv</code></p>
+        <p class="progress-text" id="dz-progress" style="display:none;"></p>
+      </div>
+
+      <div class="error-banner" id="upload-error">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        <span id="upload-error-text"></span>
+      </div>
+
+      <div class="feature-grid">
+        <div class="feature-card">
+          <svg viewBox="0 0 24 24" fill="none" stroke="var(--primary)" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+          <h3>Burst &amp; jitter</h3>
+          <p>Z-score burst detection, p95 IAT, jitter scoring per time bucket using your actual packet data.</p>
+        </div>
+        <div class="feature-card">
+          <svg viewBox="0 0 24 24" fill="none" stroke="var(--danger)" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <h3>Error spikes</h3>
+          <p>Bad-FCS bursts, retry rate spikes, and error frame correlation across your capture windows.</p>
+        </div>
+        <div class="feature-card">
+          <svg viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+          <h3>Cross-session compare</h3>
+          <p>Rank sessions by avg packet size, jitter, error rate, or throughput with a single question.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Loaded state -->
+    <div id="loaded-view">
+
+      <div class="session-strip" id="session-strip"></div>
+
+      <div class="question-card">
+        <div class="question-label">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a10 10 0 110 20 10 10 0 010-20z"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          Ask in natural language
+        </div>
+        <textarea id="question-input" placeholder="e.g. Are there bursty periods in 02_04_1? Which session has the highest jitter?"></textarea>
+        <div class="question-footer">
+          <div class="sample-chips" id="sample-chips"></div>
+          <button class="btn-primary" id="analyze-btn">
+            <svg id="analyze-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+            <span id="analyze-label">Analyze</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="error-banner" id="analyze-error">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        <span id="analyze-error-text"></span>
+      </div>
+
+      <div id="results">
+        <!-- Plan -->
+        <div class="result-section">
+          <div class="section-header">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+            <h3>Execution plan</h3>
+          </div>
+          <div class="plan-chips" id="plan-chips"></div>
+        </div>
+
+        <!-- Chart -->
+        <div class="result-section" id="chart-section" style="display:none;">
+          <p class="chart-title" id="chart-title"></p>
+          <div class="chart-container">
+            <canvas id="result-chart"></canvas>
+          </div>
+        </div>
+
+        <!-- Narrative -->
+        <div class="result-section narrative-section">
+          <div class="section-header">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a10 10 0 110 20 10 10 0 010-20z"/><path d="M8 12l2 2 4-4"/></svg>
+            <h3>AI summary</h3>
+          </div>
+          <div id="narrative-body" class="narrative-body">
+            <span class="narrating-pulse"><span class="pulse-dot"></span> Composing analysis&hellip;</span>
+          </div>
+        </div>
+
+        <!-- Table -->
+        <div class="result-section">
+          <div class="section-header">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0h10a2 2 0 002-2v-4M9 21H5a2 2 0 01-2-2v-4m0 0h18"/></svg>
+            <h3>Result rows</h3>
+          </div>
+          <div class="table-wrap" id="table-wrap"></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</main>
+
+<footer>TraceLens &middot; Python / Flask backend &middot; AI-powered wireless trace analysis</footer>
+
+<script>
+// ─── State ───────────────────────────────────────────────────
+const SESSION_TOKEN = crypto.randomUUID();
+let sessions = [];     // [{id, rows, columns}]
+let chartInstance = null;
+let thinking = false;
+
+const SAMPLE_QUESTIONS = [
+  "Are there bursty traffic periods in this session?",
+  "Which session has the highest jitter score?",
+  "Show top talkers by packet count",
+  "Are there error spikes related to bad FCS?",
+  "Compare average packet size across all sessions",
+];
+
+// ─── DOM refs ──────────────────────────────────────────────
+const uploadView   = document.getElementById("upload-view");
+const loadedView   = document.getElementById("loaded-view");
+const headerActs   = document.getElementById("header-actions");
+const dropzone     = document.getElementById("dropzone");
+const fileInput    = document.getElementById("file-input");
+const dzIcon       = document.getElementById("dz-icon");
+const dzSvgUpload  = document.getElementById("dz-svg-upload");
+const dzSvgSpin    = document.getElementById("dz-svg-spin");
+const dzMainText   = document.getElementById("dz-main-text");
+const dzProgress   = document.getElementById("dz-progress");
+const uploadError  = document.getElementById("upload-error");
+const uploadErrorT = document.getElementById("upload-error-text");
+const sessionStrip = document.getElementById("session-strip");
+const sessionBadge = document.getElementById("session-badge");
+const sessionBadgT = document.getElementById("session-badge-text");
+const clearBtn     = document.getElementById("clear-btn");
+const questionIn   = document.getElementById("question-input");
+const sampleChips  = document.getElementById("sample-chips");
+const analyzeBtn   = document.getElementById("analyze-btn");
+const analyzeIcon  = document.getElementById("analyze-icon");
+const analyzeLbl   = document.getElementById("analyze-label");
+const analyzeError = document.getElementById("analyze-error");
+const analyzeErrT  = document.getElementById("analyze-error-text");
+const resultsEl    = document.getElementById("results");
+const planChips    = document.getElementById("plan-chips");
+const chartSection = document.getElementById("chart-section");
+const chartTitle   = document.getElementById("chart-title");
+const narrativeEl  = document.getElementById("narrative-body");
+const tableWrap    = document.getElementById("table-wrap");
+
+// ─── Headers helper ────────────────────────────────────────
+function apiHeaders(extra = {}) {
+  return { "X-Session-Token": SESSION_TOKEN, ...extra };
+}
+
+// ─── Dropzone ──────────────────────────────────────────────
+dropzone.addEventListener("dragover", e => { e.preventDefault(); dropzone.classList.add("drag-over"); });
+dropzone.addEventListener("dragleave", () => dropzone.classList.remove("drag-over"));
+dropzone.addEventListener("drop", e => {
+  e.preventDefault();
+  dropzone.classList.remove("drag-over");
+  const f = e.dataTransfer.files[0];
+  if (f) handleFile(f);
+});
+dropzone.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => { if (fileInput.files[0]) handleFile(fileInput.files[0]); });
+
+async function handleFile(file) {
+  if (!file.name.endsWith(".zip")) {
+    showUploadError("Please upload a .zip file.");
+    return;
+  }
+  setDropzoneBusy(true, "Uploading & parsing sessions…");
+  uploadError.classList.remove("visible");
+
+  const form = new FormData();
+  form.append("file", file);
+  try {
+    const r = await fetch("/api/upload", {
+      method: "POST",
+      headers: apiHeaders(),
+      body: form,
+    });
+    const data = await r.json();
+    if (!r.ok || data.error) { showUploadError(data.error || "Upload failed"); return; }
+    sessions = data.sessions;
+    showLoadedState();
+  } catch (e) {
+    showUploadError("Network error: " + e.message);
+  } finally {
+    setDropzoneBusy(false);
+  }
+}
+
+function setDropzoneBusy(busy, msg = "") {
+  dzSvgUpload.style.display = busy ? "none" : "";
+  dzSvgSpin.style.display   = busy ? "" : "none";
+  dzMainText.textContent    = busy ? (msg || "Loading…") : "Drop a session ZIP or click to browse";
+  dzProgress.style.display  = busy ? "block" : "none";
+  if (busy) dzProgress.textContent = msg;
+}
+
+function showUploadError(msg) {
+  uploadErrorT.textContent = msg;
+  uploadError.classList.add("visible");
+}
+
+// ─── Show loaded state ─────────────────────────────────────
+function showLoadedState() {
+  uploadView.style.display = "none";
+  loadedView.style.display = "block";
+  headerActs.style.display = "flex";
+
+  // Session badge
+  const totalRows = sessions.reduce((a, s) => a + s.rows, 0);
+  sessionBadgT.textContent = `${sessions.length} session${sessions.length === 1 ? "" : "s"} · ${totalRows.toLocaleString()} frames`;
+
+  // Session strip
+  sessionStrip.innerHTML = sessions.map(s =>
+    `<div class="session-pill">${s.id} <span class="count">· ${s.rows.toLocaleString()}</span></div>`
+  ).join("");
+
+  // Sample chips
+  sampleChips.innerHTML = SAMPLE_QUESTIONS.map(q =>
+    `<button class="chip" data-q="${q}">${q}</button>`
+  ).join("");
+  sampleChips.querySelectorAll(".chip").forEach(c =>
+    c.addEventListener("click", () => doAnalyze(c.dataset.q))
+  );
+}
+
+// ─── Clear ─────────────────────────────────────────────────
+clearBtn.addEventListener("click", async () => {
+  await fetch("/api/clear", { method: "POST", headers: apiHeaders() });
+  sessions = [];
+  uploadView.style.display = "block";
+  loadedView.style.display = "none";
+  headerActs.style.display = "none";
+  resultsEl.style.display  = "none";
+  analyzeError.classList.remove("visible");
+  questionIn.value = "";
+});
+
+// ─── Analyze ───────────────────────────────────────────────
+analyzeBtn.addEventListener("click", () => doAnalyze());
+questionIn.addEventListener("keydown", e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") doAnalyze();
+});
+
+async function doAnalyze(q) {
+  const question = (q || questionIn.value).trim();
+  if (!question || thinking) return;
+  questionIn.value = question;
+  setThinking(true);
+  analyzeError.classList.remove("visible");
+  resultsEl.style.display = "none";
+  narrativeEl.innerHTML = `<span class="narrating-pulse"><span class="pulse-dot"></span> Composing analysis&hellip;</span>`;
+
+  try {
+    const r = await fetch("/api/analyze", {
+      method: "POST",
+      headers: { ...apiHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    const data = await r.json();
+    if (!r.ok || data.error) {
+      showAnalyzeError(data.error || "Analysis failed");
+      return;
+    }
+    renderResults(data);
+  } catch (e) {
+    showAnalyzeError("Network error: " + e.message);
+  } finally {
+    setThinking(false);
+  }
+}
+
+function setThinking(v) {
+  thinking = v;
+  analyzeBtn.disabled = v;
+  analyzeIcon.innerHTML = v
+    ? `<circle cx="12" cy="12" r="10" stroke-dasharray="56" stroke-dashoffset="28" class="spinner-icon"/>`
+    : `<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>`;
+  if (v) analyzeIcon.setAttribute("class", "spinner-icon");
+  else analyzeIcon.removeAttribute("class");
+  analyzeLbl.textContent = v ? "Analyzing…" : "Analyze";
+}
+
+function showAnalyzeError(msg) {
+  analyzeErrT.textContent = msg;
+  analyzeError.classList.add("visible");
+}
+
+// ─── Render results ────────────────────────────────────────
+function renderResults(data) {
+  const { plan, result, meta, narrative, is_cross_session } = data;
+  resultsEl.style.display = "block";
+
+  // Plan chips
+  const chips = [
+    { label: "task",    value: plan.task_type },
+    { label: "bucket",  value: plan.time_bucket },
+    { label: "session", value: is_cross_session ? "all" : plan.session_id },
+    ...(plan.group_by?.length ? [{ label: "group", value: plan.group_by.join(", ") }] : []),
+    ...(plan.metrics?.length  ? [{ label: "metrics", value: plan.metrics.join(", ") }] : []),
+    { label: "rows",    value: `${meta.rows_after_filter} → ${meta.result_rows}` },
+  ];
+  planChips.innerHTML = chips.map(c =>
+    `<span class="plan-chip"><span class="label">${c.label}</span><span class="value">${c.value}</span></span>`
+  ).join("");
+
+  // Chart
+  renderChart(plan, result);
+
+  // Narrative
+  narrativeEl.innerHTML = narrative
+    ? marked.parse(narrative)
+    : "<span style='color:var(--text-dim);font-size:13px;'>No narrative returned.</span>";
+
+  // Table
+  renderTable(result);
+}
+
+function renderChart(plan, result) {
+  if (plan.plot === "none" || result.length === 0) {
+    chartSection.style.display = "none";
+    return;
+  }
+  chartSection.style.display = "block";
+  chartTitle.textContent = plan.question_rephrased || "Analysis result";
+
+  if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
+  const ctx = document.getElementById("result-chart").getContext("2d");
+
+  const PREFERRED_BY_TASK = {
+    error_spike_analysis:   ["error_frame_count","bad_fcs_count","error_frame_rate","bad_fcs_rate","retry_rate"],
+    delay_jitter_analysis:  ["p95_iat","std_iat","jitter_score","mean_iat","mean_duration_us"],
+  };
+  const PREFERRED_BAR = ["comparison_score","avg_packet_size","packets_per_second","bytes_per_second",
+                          "packet_count","bytes_sum","error_frame_count","bad_fcs_count","retry_count"];
+
+  const keys = Object.keys(result[0]);
+
+  if (plan.plot === "line") {
+    const xKey = keys.includes("time_bucket") ? "time_bucket" : keys[0];
+    const prefs = PREFERRED_BY_TASK[plan.task_type] || ["packet_count","packets_per_s","bytes_sum"];
+    const yKey = prefs.find(k => keys.includes(k)) || keys[1] || keys[0];
+
+    const labels = result.map(r => {
+      const v = r[xKey];
+      if (!v) return "";
+      const d = new Date(v);
+      return isNaN(d) ? String(v) : d.toISOString().slice(11, 19);
+    });
+    const vals = result.map(r => r[yKey] ?? null);
+    const isBurst = plan.task_type === "burst_detection";
+
+    chartInstance = new Chart(ctx, {
+      type: "line",
+      data: {
+        labels,
+        datasets: [{
+          label: yKey,
+          data: vals,
+          borderColor: "#2a6fff",
+          backgroundColor: "#2a6fff18",
+          fill: true,
+          tension: 0.35,
+          pointRadius: isBurst ? result.map(r => r.is_burst ? 5 : 2) : 2,
+          pointBackgroundColor: isBurst ? result.map(r => r.is_burst ? "#ff4b6e" : "#2a6fff") : "#2a6fff",
+          borderWidth: 2,
+        }],
+      },
+      options: chartOptions(yKey),
+    });
+  } else {
+    const xKey = keys.includes("session_id") ? "session_id" : keys[0];
+    const yKey = PREFERRED_BAR.find(k => keys.includes(k)) || keys[keys.length - 1];
+    chartInstance = new Chart(ctx, {
+      type: "bar",
+      data: {
+        labels: result.map(r => r[xKey] ?? ""),
+        datasets: [{
+          label: yKey,
+          data: result.map(r => r[yKey] ?? 0),
+          backgroundColor: result.map((_, i) => i === 0 ? "#00e5c0aa" : "#2a6fffaa"),
+          borderColor: result.map((_, i) => i === 0 ? "#00e5c0" : "#2a6fff"),
+          borderWidth: 1,
+          borderRadius: 6,
+        }],
+      },
+      options: chartOptions(yKey),
+    });
+  }
+}
+
+function chartOptions(yKey) {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: "#13162299",
+        borderColor: "#1e2235",
+        borderWidth: 1,
+        titleColor: "#d4d8f0",
+        bodyColor: "#a0a8c0",
+        titleFont: { family: "'Space Mono', monospace", size: 11 },
+        bodyFont:  { family: "'Space Mono', monospace", size: 11 },
+        callbacks: {
+          label: ctx => `${yKey}: ${fmtNum(ctx.parsed.y)}`,
+        },
+      },
+    },
+    scales: {
+      x: {
+        grid: { color: "#1e223544" },
+        ticks: { color: "#4a5070", font: { family: "'Space Mono', monospace", size: 10 }, maxRotation: 25 },
+      },
+      y: {
+        grid: { color: "#1e223544" },
+        ticks: { color: "#4a5070", font: { family: "'Space Mono', monospace", size: 10 },
+                 callback: v => fmtNum(v) },
+      },
+    },
+  };
+}
+
+function fmtNum(v) {
+  if (v == null) return "—";
+  const n = Number(v);
+  if (!isFinite(n)) return "—";
+  if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  if (Math.abs(n) < 0.01 && n !== 0) return n.toExponential(2);
+  return n.toFixed(3).replace(/\.?0+$/, "");
+}
+
+function renderTable(rows) {
+  if (!rows.length) { tableWrap.innerHTML = "<p style='padding:16px;color:var(--text-dim);font-size:13px;'>No rows returned.</p>"; return; }
+  const cols = Object.keys(rows[0]);
+  const thead = `<thead><tr>${cols.map(c => `<th>${c}</th>`).join("")}</tr></thead>`;
+  const tbody = `<tbody>${rows.map(r => {
+    const isBurst = r.is_burst === true;
+    const isSpike = r.is_error_spike === true;
+    return `<tr class="${isBurst ? "td-burst" : isSpike ? "td-spike" : ""}">
+      ${cols.map(c => {
+        const v = r[c];
+        if (v === null || v === undefined) return `<td class="td-false">—</td>`;
+        if (typeof v === "boolean") return `<td class="${v ? "td-true" : "td-false"}">${v}</td>`;
+        if (typeof v === "number") return `<td class="td-number">${fmtNum(v)}</td>`;
+        if (typeof v === "string" && v.includes("T") && v.includes(":")) {
+          return `<td>${v.slice(11, 19)}</td>`;
+        }
+        return `<td>${v}</td>`;
+      }).join("")}
+    </tr>`;
+  }).join("")}</tbody>`;
+  tableWrap.innerHTML = `<table>${thead}${tbody}</table>`;
+}
+</script>
+</body>
+</html>

@@ -11,7 +11,7 @@ stays in Python. The browser handles rendering: charts via Chart.js, markdown vi
 ```bash
 pip install -r requirements.txt
 export OPENAI_API_KEY="sk-..."          # required for AI plan + narrative
-export OPENAI_MODEL="gpt-4o"           # optional, default is gpt-4o
+export OPENAI_MODEL="gpt-5.4"           # optional, default is gpt-4o
 flask --app app run --debug --port 5000
 ```
 
@@ -27,7 +27,7 @@ my_captures.zip
 │   ├── 02_04_tap.csv
 │   ├── 02_04_mac.csv
 │   ├── 02_04_error.csv
-│   └── 02_04_udp.csv
+│   └── 02_04_udp.csv  (optional)
 └── 02_04_2/
     ├── ...
 ```

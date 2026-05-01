@@ -30,20 +30,6 @@ MODEL_SUMMARY = "gpt-5.4"
 DEFAULT_ROOT = "dataset"
 OUTPUT_DIR = "outputs"
 
-# Manual MAC-retry validation for the bundled class-project dataset.
-# These counts are intentionally applied only at the session-summary layer;
-# raw tables remain unchanged for other analyses.
-GROUND_TRUTH_RETRY_COUNTS = {
-    "02_03_1": 0,
-    "02_03_2": 839,
-    "02_04_1": 0,
-    "02_04_2": 0,
-    "02_05_1": 0,
-    "02_05_2": 0,
-    "02_06_1": 0,
-    "02_06_2": 0,
-}
-
 client: Optional[OpenAI] = None
 
 
@@ -323,8 +309,10 @@ def flag_series_as_bool(s: pd.Series) -> pd.Series:
         return pd.to_numeric(s, errors="coerce").fillna(0).eq(1)
 
     text = s.astype("string").str.strip().str.lower()
-    numeric = pd.to_numeric(text, errors="coerce")
-    return text.isin(["true", "t", "yes", "y"]) | numeric.eq(1).fillna(False)
+    return (
+        text.isin(["true", "t", "yes", "y", "1"])
+        | text.str.contains("retry|retrans", na=False)
+    )
 
 
 def add_mac_retry_metric_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -1671,8 +1659,6 @@ def summarize_session_result(session_id: str, session_df: pd.DataFrame, plan: Di
     )
     mac_rows = int(filtered_df["mac_row_flag"].fillna(False).sum()) if "mac_row_flag" in filtered_df.columns else 0
     retry_count = int(filtered_df["mac_retry_flag"].fillna(False).sum()) if "mac_retry_flag" in filtered_df.columns else 0
-    if session_id in GROUND_TRUTH_RETRY_COUNTS and not plan.get("filters"):
-        retry_count = GROUND_TRUTH_RETRY_COUNTS[session_id]
     retry_rate = _divide_or_nan(retry_count, mac_rows)
 
     summary: Dict[str, Any] = {

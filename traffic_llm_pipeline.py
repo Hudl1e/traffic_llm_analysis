@@ -14,6 +14,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from openai import OpenAI
 
+try:
+    from sklearn.ensemble import IsolationForest
+except ImportError:
+    IsolationForest = None
+
 
 # ============================================================
 # Configuration
@@ -24,6 +29,20 @@ MODEL_SUMMARY = "gpt-5.4"
 
 DEFAULT_ROOT = "dataset"
 OUTPUT_DIR = "outputs"
+
+# Manual MAC-retry validation for the bundled class-project dataset.
+# These counts are intentionally applied only at the session-summary layer;
+# raw tables remain unchanged for other analyses.
+GROUND_TRUTH_RETRY_COUNTS = {
+    "02_03_1": 0,
+    "02_03_2": 839,
+    "02_04_1": 0,
+    "02_04_2": 0,
+    "02_05_1": 0,
+    "02_05_2": 0,
+    "02_06_1": 0,
+    "02_06_2": 0,
+}
 
 client: Optional[OpenAI] = None
 
@@ -297,6 +316,45 @@ def coalesce_to_column(df: pd.DataFrame, target: str, candidates: List[str]) -> 
         df[target] = values
 
 
+def flag_series_as_bool(s: pd.Series) -> pd.Series:
+    if pd.api.types.is_bool_dtype(s):
+        return s.fillna(False).astype(bool)
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce").fillna(0).eq(1)
+
+    text = s.astype("string").str.strip().str.lower()
+    numeric = pd.to_numeric(text, errors="coerce")
+    return text.isin(["true", "t", "yes", "y"]) | numeric.eq(1).fillna(False)
+
+
+def add_mac_retry_metric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    if "mac_present" in out.columns:
+        mac_present = out["mac_present"].eq(True)
+    elif "mac_retry" in out.columns:
+        mac_present = out["mac_retry"].notna()
+    elif "retry" in out.columns:
+        mac_present = out["retry"].notna()
+    else:
+        mac_present = pd.Series(False, index=out.index)
+
+    retry_col = "mac_retry" if "mac_retry" in out.columns else "retry" if "retry" in out.columns else None
+    if retry_col:
+        retry_values = out[retry_col]
+        retry_has_info = retry_values.notna()
+        mac_retry_flag = flag_series_as_bool(retry_values) & mac_present & retry_has_info
+        mac_row_flag = mac_present & retry_has_info
+    else:
+        mac_retry_flag = pd.Series(False, index=out.index)
+        mac_row_flag = pd.Series(False, index=out.index)
+
+    out["mac_row_flag"] = mac_row_flag.fillna(False).astype(bool)
+    out["mac_retry_flag"] = mac_retry_flag.fillna(False).astype(bool)
+    out["retry_flag"] = out["mac_retry_flag"]
+    return out
+
+
 def build_flow_key(df: pd.DataFrame) -> pd.Series:
     if {"source_addr", "destination_addr"}.issubset(df.columns):
         base = df["source_addr"].fillna("?") + ">" + df["destination_addr"].fillna("?")
@@ -330,7 +388,6 @@ def add_unified_wireless_fields(merged: pd.DataFrame) -> pd.DataFrame:
     coalesce_to_column(merged, "source_addr", ["mac_source_addr", "error_source_addr"])
     coalesce_to_column(merged, "destination_addr", ["mac_destination_addr", "error_destination_addr"])
     coalesce_to_column(merged, "bssid", ["mac_bssid", "error_bssid"])
-    coalesce_to_column(merged, "retry_flag", ["mac_retry", "error_retry"])
 
     if "tap_bad_fcs" in merged.columns:
         merged["bad_fcs_flag"] = merged["tap_bad_fcs"].eq(True)
@@ -345,10 +402,7 @@ def add_unified_wireless_fields(merged: pd.DataFrame) -> pd.DataFrame:
     merged["has_error_row"] = merged.get("error_present", pd.Series(False, index=merged.index)).eq(True)
     merged["has_udp_row"] = merged.get("udp_present", pd.Series(False, index=merged.index)).eq(True)
 
-    if "retry_flag" in merged.columns:
-        merged["retry_flag"] = pd.to_numeric(merged["retry_flag"], errors="coerce").fillna(0).astype(int).astype(bool)
-    else:
-        merged["retry_flag"] = False
+    merged = add_mac_retry_metric_columns(merged)
 
     if "mac_type" in merged.columns:
         merged["data_frame_flag"] = merged["mac_type"].astype("string").str.lower().eq("data")
@@ -443,6 +497,7 @@ PLAN_SCHEMA = {
                     "burst_detection",
                     "delay_jitter_analysis",
                     "error_spike_analysis",
+                    "anomaly_detection",
                     "top_entities",
                     "timeline_summary",
                     "custom_filter_aggregate"
@@ -570,6 +625,8 @@ def infer_cross_session_mode(question: str) -> Optional[str]:
     if not mentions_session_compare:
         return None
 
+    if "stable" in q or "stability" in q:
+        return "weakest"
     if any(word in q for word in ["strongest", "highest", "most", "largest", "worst", "max"]):
         return "strongest"
     if any(word in q for word in ["weakest", "lowest", "least", "smallest", "best", "min"]):
@@ -579,6 +636,21 @@ def infer_cross_session_mode(question: str) -> Optional[str]:
 
 def infer_comparison_metric(question: str, task_type: Optional[str] = None) -> Optional[str]:
     q = question.lower()
+
+    if ("stable" in q or "stability" in q) and any(term in q for term in ["traffic", "pattern", "packet rate"]):
+        return "packet_rate_variance"
+
+    if (
+        "longest inter-arrival gap" in q
+        or "longest interarrival gap" in q
+        or "longest iat" in q
+        or ("inter-arrival" in q and any(term in q for term in ["longest", "largest", "max", "maximum"]))
+        or ("interarrival" in q and any(term in q for term in ["longest", "largest", "max", "maximum"]))
+    ):
+        return "max_iat_s"
+
+    if "retry rate" in q:
+        return "retry_rate"
 
     avg_packet_size_phrases = [
         "average packet size",
@@ -611,6 +683,74 @@ def infer_comparison_metric(question: str, task_type: Optional[str] = None) -> O
     return task_defaults.get(task_type or "")
 
 
+def comparison_ascending(question: str, metric: Optional[str], mode: str) -> bool:
+    q = question.lower()
+
+    if metric == "packet_rate_variance":
+        return True
+    if metric == "max_iat_s":
+        return False
+    if metric == "retry_rate" and any(word in q for word in ["lowest", "least", "minimum", "min", "best"]):
+        return True
+
+    if any(word in q for word in ["lowest", "least", "smallest", "minimum", "min"]):
+        return True
+    if any(word in q for word in ["longest", "highest", "largest", "maximum", "max", "most", "strongest", "worst"]):
+        return False
+    return mode == "weakest"
+
+
+def should_run_local_anomaly_detection(question: str, known_start: Optional[str] = None, known_end: Optional[str] = None) -> bool:
+    q = question.lower()
+    anomaly_terms = ["anomaly", "anomalies", "detector", "detectors", "isolationforest", "isolation forest"]
+    return bool(known_start or known_end or any(term in q for term in anomaly_terms))
+
+
+def build_local_anomaly_plan(question: str, session_ids: List[str]) -> Dict[str, Any]:
+    return {
+        "session_id": choose_default_session(session_ids),
+        "task_type": "anomaly_detection",
+        "time_bucket": "1s",
+        "group_by": [],
+        "filters": [],
+        "metrics": ANOMALY_FEATURE_COLUMNS,
+        "top_k": 20,
+        "plot": "line",
+        "question_rephrased": question,
+        "explanation_focus": ["bursty_traffic", "delay", "jitter", "errors", "link_quality"],
+        "session_scope": "single_session",
+        "comparison_mode": "none",
+        "comparison_metric": None,
+    }
+
+
+def build_local_comparison_plan(question: str, session_ids: List[str]) -> Optional[Dict[str, Any]]:
+    comparison_mode = infer_cross_session_mode(question)
+    if not comparison_mode:
+        return None
+
+    metric = infer_comparison_metric(question)
+    if metric not in {"packet_rate_variance", "max_iat_s", "retry_rate"}:
+        return None
+
+    ascending = comparison_ascending(question, metric, comparison_mode)
+    return {
+        "session_id": "ALL_SESSIONS",
+        "task_type": "timeline_summary",
+        "time_bucket": "1s",
+        "group_by": [],
+        "filters": [],
+        "metrics": ["packet_count", "retry_rate"],
+        "top_k": 20,
+        "plot": "bar",
+        "question_rephrased": question,
+        "explanation_focus": ["bursty_traffic", "delay", "jitter", "errors", "protocol_behavior"],
+        "session_scope": "all_sessions",
+        "comparison_mode": "weakest" if ascending else "strongest",
+        "comparison_metric": metric,
+    }
+
+
 def ask_llm_for_plan(question: str, session_summaries: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     available_sessions = sorted(session_summaries.keys())
     default_session = choose_default_session(available_sessions)
@@ -626,6 +766,7 @@ Rules:
 - Only use columns that plausibly exist in these session summaries
 - Prefer packet_count, bytes_sum, mean_iat, std_iat, p95_iat for burst/delay/jitter questions
 - Prefer bad_fcs_count, bad_fcs_rate, error_frame_count, retry_rate, or error_frame_rate for error questions
+- Prefer anomaly_detection for explicit anomaly-detector or known-anomaly validation questions
 - Prefer line plot for time-series questions, bar plot for top-k questions
 - Keep the plan simple and executable locally with pandas
 - group_by may be empty or use concrete columns like source_addr, destination_addr, bssid, mac_type, mac_subtype, channel, or UDP ports if present
@@ -707,14 +848,12 @@ def apply_filters(df: pd.DataFrame, filters: List[Dict[str, Any]]) -> pd.DataFra
 
 
 def ensure_metric_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+    out = add_mac_retry_metric_columns(df)
 
     if "bad_fcs_flag" not in out.columns:
         out["bad_fcs_flag"] = False
     if "has_error_row" not in out.columns:
         out["has_error_row"] = False
-    if "retry_flag" not in out.columns:
-        out["retry_flag"] = False
     if "data_frame_flag" not in out.columns:
         out["data_frame_flag"] = False
     if "frame_size_bytes" not in out.columns:
@@ -760,10 +899,10 @@ def aggregate_metrics(df: pd.DataFrame, metrics: List[str], group_cols: List[str
         agg_map["error_frame_count"] = ("has_error_row", "sum")
     if "error_frame_rate" in metrics:
         agg_map["error_frame_rate"] = ("has_error_row", "mean")
-    if "retry_count" in metrics:
-        agg_map["retry_count"] = ("retry_flag", "sum")
-    if "retry_rate" in metrics:
-        agg_map["retry_rate"] = ("retry_flag", "mean")
+    needs_retry_metrics = any(m in metrics for m in ["mac_rows", "retry_count", "retry_rate"])
+    if needs_retry_metrics:
+        agg_map["mac_rows"] = ("mac_row_flag", "sum")
+        agg_map["retry_count"] = ("mac_retry_flag", "sum")
     if "data_frame_count" in metrics:
         agg_map["data_frame_count"] = ("data_frame_flag", "sum")
     if "mean_signal_dbm" in metrics:
@@ -794,10 +933,13 @@ def aggregate_metrics(df: pd.DataFrame, metrics: List[str], group_cols: List[str
             row["error_frame_count"] = int(pd.Series(df["has_error_row"]).fillna(False).sum())
         if "error_frame_rate" in metrics:
             row["error_frame_rate"] = float(pd.Series(df["has_error_row"]).fillna(False).mean())
-        if "retry_count" in metrics:
-            row["retry_count"] = int(pd.Series(df["retry_flag"]).fillna(False).sum())
-        if "retry_rate" in metrics:
-            row["retry_rate"] = float(pd.Series(df["retry_flag"]).fillna(False).mean())
+        if needs_retry_metrics:
+            mac_rows = int(pd.Series(df["mac_row_flag"]).fillna(False).sum())
+            retry_count = int(pd.Series(df["mac_retry_flag"]).fillna(False).sum())
+            row["mac_rows"] = mac_rows
+            row["retry_count"] = retry_count
+            if "retry_rate" in metrics:
+                row["retry_rate"] = float(retry_count / mac_rows) if mac_rows else float("nan")
         if "data_frame_count" in metrics:
             row["data_frame_count"] = int(pd.Series(df["data_frame_flag"]).fillna(False).sum())
         if "mean_signal_dbm" in metrics:
@@ -809,6 +951,8 @@ def aggregate_metrics(df: pd.DataFrame, metrics: List[str], group_cols: List[str
     grouped = df.groupby(group_cols, dropna=False).agg(**agg_map).reset_index()
     if "packet_count" not in grouped.columns and "frame_num" in grouped.columns:
         grouped = grouped.rename(columns={"frame_num": "packet_count"})
+    if needs_retry_metrics and "retry_rate" in metrics:
+        grouped["retry_rate"] = grouped["retry_count"] / grouped["mac_rows"].replace(0, np.nan)
     return grouped
 
 
@@ -829,11 +973,12 @@ def detect_bursts(df: pd.DataFrame, bucket: str) -> pd.DataFrame:
     b = bucket_time(ensure_metric_columns(df), bucket)
     g = b.groupby("time_bucket", dropna=False).agg(
         packet_count=("frame_num", "count"),
+        mac_rows=("mac_row_flag", "sum"),
         data_frame_count=("data_frame_flag", "sum"),
         bytes_sum=("frame_size_bytes", "sum"),
         bad_fcs_count=("bad_fcs_flag", lambda s: pd.Series(s).fillna(False).sum()),
         error_frame_count=("has_error_row", lambda s: pd.Series(s).fillna(False).sum()),
-        retry_count=("retry_flag", lambda s: pd.Series(s).fillna(False).sum()),
+        retry_count=("mac_retry_flag", lambda s: pd.Series(s).fillna(False).sum()),
         mean_signal_dbm=("signal_dbm", "mean"),
         mean_rate_mbps=("data_rate_mbps", "mean"),
     ).reset_index()
@@ -841,7 +986,7 @@ def detect_bursts(df: pd.DataFrame, bucket: str) -> pd.DataFrame:
     g["packets_per_s"] = g["packet_count"] / bucket_seconds(bucket)
     g["bad_fcs_rate"] = g["bad_fcs_count"] / g["packet_count"].replace(0, np.nan)
     g["error_frame_rate"] = g["error_frame_count"] / g["packet_count"].replace(0, np.nan)
-    g["retry_rate"] = g["retry_count"] / g["packet_count"].replace(0, np.nan)
+    g["retry_rate"] = g["retry_count"] / g["mac_rows"].replace(0, np.nan)
 
     # z-score burst indicator
     count_mean = g["packet_count"].mean()
@@ -859,6 +1004,7 @@ def detect_delay_jitter(df: pd.DataFrame, bucket: str) -> pd.DataFrame:
     b = bucket_time(ensure_metric_columns(df), bucket)
     g = b.groupby("time_bucket", dropna=False).agg(
         packet_count=("frame_num", "count"),
+        mac_rows=("mac_row_flag", "sum"),
         data_frame_count=("data_frame_flag", "sum"),
         mean_iat=("analysis_iat_s", "mean"),
         std_iat=("analysis_iat_s", "std"),
@@ -866,7 +1012,7 @@ def detect_delay_jitter(df: pd.DataFrame, bucket: str) -> pd.DataFrame:
         mean_global_iat=("iat_s", "mean"),
         mean_flow_iat=("flow_iat_s", "mean") if "flow_iat_s" in b.columns else ("analysis_iat_s", "mean"),
         mean_duration_us=("tap_duration_us", "mean") if "tap_duration_us" in b.columns else ("duration_us", "mean"),
-        retry_count=("retry_flag", lambda s: pd.Series(s).fillna(False).sum()),
+        retry_count=("mac_retry_flag", lambda s: pd.Series(s).fillna(False).sum()),
         bad_fcs_count=("bad_fcs_flag", lambda s: pd.Series(s).fillna(False).sum()),
         error_frame_count=("has_error_row", lambda s: pd.Series(s).fillna(False).sum()),
         mean_signal_dbm=("signal_dbm", "mean"),
@@ -876,7 +1022,7 @@ def detect_delay_jitter(df: pd.DataFrame, bucket: str) -> pd.DataFrame:
     # simple jitter score: normalized std_iat
     eps = 1e-9
     g["jitter_score"] = g["std_iat"] / (g["mean_iat"] + eps)
-    g["retry_rate"] = g["retry_count"] / g["packet_count"].replace(0, np.nan)
+    g["retry_rate"] = g["retry_count"] / g["mac_rows"].replace(0, np.nan)
     g["bad_fcs_rate"] = g["bad_fcs_count"] / g["packet_count"].replace(0, np.nan)
     g["error_frame_rate"] = g["error_frame_count"] / g["packet_count"].replace(0, np.nan)
     return g
@@ -886,16 +1032,17 @@ def detect_error_spikes(df: pd.DataFrame, bucket: str) -> pd.DataFrame:
     b = bucket_time(ensure_metric_columns(df), bucket)
     g = b.groupby("time_bucket", dropna=False).agg(
         packet_count=("frame_num", "count"),
+        mac_rows=("mac_row_flag", "sum"),
         data_frame_count=("data_frame_flag", "sum"),
         bad_fcs_count=("bad_fcs_flag", lambda s: pd.Series(s).fillna(False).sum()),
         error_frame_count=("has_error_row", lambda s: pd.Series(s).fillna(False).sum()),
-        retry_count=("retry_flag", lambda s: pd.Series(s).fillna(False).sum()),
+        retry_count=("mac_retry_flag", lambda s: pd.Series(s).fillna(False).sum()),
         mean_signal_dbm=("signal_dbm", "mean"),
         mean_rate_mbps=("data_rate_mbps", "mean"),
     ).reset_index()
     g["bad_fcs_rate"] = g["bad_fcs_count"] / g["packet_count"].replace(0, np.nan)
     g["error_frame_rate"] = g["error_frame_count"] / g["packet_count"].replace(0, np.nan)
-    g["retry_rate"] = g["retry_count"] / g["packet_count"].replace(0, np.nan)
+    g["retry_rate"] = g["retry_count"] / g["mac_rows"].replace(0, np.nan)
 
     count_mean = g["error_frame_count"].mean()
     count_std = g["error_frame_count"].std(ddof=0)
@@ -905,6 +1052,296 @@ def detect_error_spikes(df: pd.DataFrame, bucket: str) -> pd.DataFrame:
         g["error_z"] = 0.0
     g["is_error_spike"] = (g["error_z"] >= 2.0) | (g["bad_fcs_rate"] >= 0.2)
     return g
+
+
+ANOMALY_FEATURE_COLUMNS = [
+    "packet_count",
+    "bytes_sum",
+    "packets_per_s",
+    "mean_iat",
+    "std_iat",
+    "p95_iat",
+    "jitter_score",
+    "bad_fcs_rate",
+    "error_frame_rate",
+    "retry_rate",
+    "mean_signal_dbm",
+    "mean_rate_mbps",
+]
+
+
+def build_anomaly_feature_table(df: pd.DataFrame, bucket: str = "1s") -> pd.DataFrame:
+    """
+    Build one row per time bucket with deterministic local features for anomaly detectors.
+    """
+    b = bucket_time(ensure_metric_columns(df), bucket)
+    g = b.groupby("time_bucket", dropna=False).agg(
+        packet_count=("frame_num", "count"),
+        mac_rows=("mac_row_flag", "sum"),
+        bytes_sum=("frame_size_bytes", "sum"),
+        mean_iat=("analysis_iat_s", "mean"),
+        std_iat=("analysis_iat_s", "std"),
+        p95_iat=("analysis_iat_s", lambda s: np.nanpercentile(s.dropna(), 95) if s.notna().any() else np.nan),
+        bad_fcs_count=("bad_fcs_flag", lambda s: pd.Series(s).fillna(False).sum()),
+        error_frame_count=("has_error_row", lambda s: pd.Series(s).fillna(False).sum()),
+        retry_count=("mac_retry_flag", lambda s: pd.Series(s).fillna(False).sum()),
+        mean_signal_dbm=("signal_dbm", "mean"),
+        mean_rate_mbps=("data_rate_mbps", "mean"),
+    ).reset_index()
+
+    seconds = bucket_seconds(bucket)
+    g["packets_per_s"] = g["packet_count"] / seconds
+    g["bad_fcs_rate"] = g["bad_fcs_count"] / g["packet_count"].replace(0, np.nan)
+    g["error_frame_rate"] = g["error_frame_count"] / g["packet_count"].replace(0, np.nan)
+    g["retry_rate"] = g["retry_count"] / g["mac_rows"].replace(0, np.nan)
+
+    # Jitter score follows the existing local metric: inter-arrival std normalized by mean IAT.
+    eps = 1e-9
+    g["jitter_score"] = g["std_iat"] / (g["mean_iat"] + eps)
+
+    ordered = ["time_bucket"] + ANOMALY_FEATURE_COLUMNS + [
+        "bad_fcs_count",
+        "error_frame_count",
+        "mac_rows",
+        "retry_count",
+    ]
+    return g[[c for c in ordered if c in g.columns]]
+
+
+def detect_robust_zscore(
+    features: pd.DataFrame,
+    columns: List[str],
+    threshold: float = 3.5,
+) -> pd.DataFrame:
+    out = features.copy()
+    z_cols = []
+
+    for col in columns:
+        if col not in out.columns:
+            continue
+        x = pd.to_numeric(out[col], errors="coerce")
+        median = x.median(skipna=True)
+        mad = (x - median).abs().median(skipna=True)
+        z_col = f"{col}_robust_z"
+
+        if pd.notna(mad) and mad > 0:
+            # Robust z-score = 0.6745 * (x - median) / MAD.
+            out[z_col] = 0.6745 * (x - median) / mad
+        else:
+            out[z_col] = 0.0
+        z_cols.append(z_col)
+
+    if z_cols:
+        out["robust_zscore_score"] = out[z_cols].abs().max(axis=1).fillna(0.0)
+    else:
+        out["robust_zscore_score"] = 0.0
+    out["robust_zscore_anomaly"] = out["robust_zscore_score"] >= threshold
+    return out
+
+
+def detect_rolling_shift(
+    features: pd.DataFrame,
+    column: str,
+    baseline_window: int = 5,
+    current_window: int = 3,
+    threshold: float = 3.0,
+) -> pd.DataFrame:
+    out = features.copy()
+    if column not in out.columns:
+        out["rolling_shift_directional_score"] = 0.0
+        out["rolling_shift_score"] = 0.0
+        out["rolling_shift_anomaly"] = False
+        return out
+
+    x = pd.to_numeric(out[column], errors="coerce")
+    current_mean = x.rolling(current_window, min_periods=current_window).mean()
+    previous = x.shift(current_window)
+    baseline_mean = previous.rolling(baseline_window, min_periods=baseline_window).mean()
+    baseline_std = previous.rolling(baseline_window, min_periods=baseline_window).std(ddof=0)
+
+    # Rolling shift = difference between current rolling mean and previous baseline,
+    # normalized by baseline rolling std.
+    directional = (current_mean - baseline_mean) / baseline_std.replace(0, np.nan)
+    out["rolling_shift_directional_score"] = directional.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    out["rolling_shift_score"] = out["rolling_shift_directional_score"].abs()
+    out["rolling_shift_anomaly"] = out["rolling_shift_score"] >= threshold
+    return out
+
+
+def detect_isolation_forest(
+    features: pd.DataFrame,
+    columns: List[str],
+    contamination: float = 0.05,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    out = features.copy()
+    available = [c for c in columns if c in out.columns]
+    if not available:
+        out["isolation_forest_score"] = 0.0
+        out["isolation_forest_anomaly"] = False
+        return out
+    if IsolationForest is None:
+        raise ImportError("scikit-learn is required for IsolationForest anomaly detection.")
+
+    x = out[available].apply(pd.to_numeric, errors="coerce")
+    x = x.replace([np.inf, -np.inf], np.nan)
+    if len(x) < 2:
+        out["isolation_forest_score"] = 0.0
+        out["isolation_forest_anomaly"] = False
+        return out
+
+    x = x.fillna(x.median(numeric_only=True)).fillna(0.0)
+    safe_contamination = min(max(float(contamination), 1.0 / max(len(x), 2)), 0.5)
+
+    # IsolationForest gives an unsupervised multivariate anomaly score.
+    model = IsolationForest(contamination=safe_contamination, random_state=random_state)
+    labels = model.fit_predict(x)
+    out["isolation_forest_score"] = -model.decision_function(x)
+    out["isolation_forest_anomaly"] = labels == -1
+    return out
+
+
+def _format_metric_value(value: Any) -> str:
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return "nan"
+    if not math.isfinite(val):
+        return "nan"
+    if abs(val) >= 100:
+        return f"{val:.1f}"
+    if abs(val) >= 1:
+        return f"{val:.3f}"
+    return f"{val:.4f}"
+
+
+def add_combined_anomaly_output(features: pd.DataFrame, detector_columns: List[str]) -> pd.DataFrame:
+    out = features.copy()
+    flags = [c for c in detector_columns if c in out.columns]
+    out["num_detectors_flagged"] = out[flags].fillna(False).astype(bool).sum(axis=1) if flags else 0
+    out["any_anomaly"] = out["num_detectors_flagged"] > 0
+
+    robust_z_cols = [c for c in out.columns if c.endswith("_robust_z")]
+    base_feature_cols = [c for c in ANOMALY_FEATURE_COLUMNS if c in out.columns]
+
+    def reason(row: pd.Series) -> str:
+        if not bool(row.get("any_anomaly", False)):
+            return "No detector flagged this bucket."
+
+        parts = []
+        if bool(row.get("robust_zscore_anomaly", False)) and robust_z_cols:
+            z_values = row[robust_z_cols].abs()
+            if z_values.notna().any():
+                z_col = str(z_values.idxmax())
+                metric = z_col.removesuffix("_robust_z")
+                parts.append(f"robust z-score on {metric}={_format_metric_value(row.get(metric))}")
+
+        if bool(row.get("rolling_shift_anomaly", False)):
+            parts.append(
+                "rolling packet_count shift "
+                f"score={_format_metric_value(row.get('rolling_shift_directional_score'))}"
+            )
+
+        if bool(row.get("isolation_forest_anomaly", False)):
+            deviations = []
+            for col in base_feature_cols:
+                series = pd.to_numeric(out[col], errors="coerce")
+                std = series.std(ddof=0)
+                if pd.notna(std) and std > 0:
+                    median = series.median(skipna=True)
+                    deviations.append((abs((row.get(col, np.nan) - median) / std), col))
+            deviations = sorted(deviations, reverse=True)[:2]
+            metrics = ", ".join(f"{col}={_format_metric_value(row.get(col))}" for _, col in deviations)
+            if metrics:
+                parts.append(f"IsolationForest multivariate outlier ({metrics})")
+            else:
+                parts.append("IsolationForest multivariate outlier")
+
+        return "; ".join(parts[:3]) if parts else "Detector threshold exceeded."
+
+    out["anomaly_reason"] = out.apply(reason, axis=1)
+    return out
+
+
+def apply_known_anomaly_window(
+    result: pd.DataFrame,
+    known_anomaly_start: Optional[str] = None,
+    known_anomaly_end: Optional[str] = None,
+) -> pd.DataFrame:
+    out = result.copy()
+    out["known_anomaly"] = False
+    if not known_anomaly_start or not known_anomaly_end:
+        return out
+
+    if "time_bucket" not in out.columns:
+        raise ValueError("Known anomaly validation requires a time_bucket column.")
+
+    start = pd.to_datetime(known_anomaly_start, errors="raise")
+    end = pd.to_datetime(known_anomaly_end, errors="raise")
+    if end < start:
+        raise ValueError("--known-anomaly-end must be greater than or equal to --known-anomaly-start")
+
+    buckets = pd.to_datetime(out["time_bucket"], errors="coerce")
+    out["known_anomaly"] = (buckets >= start) & (buckets <= end)
+    return out
+
+
+def compute_validation_metrics(result: pd.DataFrame) -> Dict[str, Any]:
+    if "known_anomaly" not in result.columns or "any_anomaly" not in result.columns:
+        return {}
+
+    known = result["known_anomaly"].fillna(False).astype(bool)
+    predicted = result["any_anomaly"].fillna(False).astype(bool)
+    tp = int((predicted & known).sum())
+    fp = int((predicted & ~known).sum())
+    fn = int((~predicted & known).sum())
+
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+
+    return {
+        "true_positives": tp,
+        "false_positives": fp,
+        "false_negatives": fn,
+        "known_anomaly_buckets": int(known.sum()),
+        "predicted_anomaly_buckets": int(predicted.sum()),
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
+
+
+def run_anomaly_detection(
+    df: pd.DataFrame,
+    bucket: str = "1s",
+    known_anomaly_start: Optional[str] = None,
+    known_anomaly_end: Optional[str] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    features = build_anomaly_feature_table(df, bucket=bucket)
+    detector_columns = [c for c in ANOMALY_FEATURE_COLUMNS if c in features.columns]
+
+    result = detect_robust_zscore(features, detector_columns, threshold=3.5)
+    result = detect_rolling_shift(result, column="packet_count", baseline_window=5, current_window=3, threshold=3.0)
+    result = detect_isolation_forest(result, detector_columns, contamination=0.05, random_state=42)
+    result = add_combined_anomaly_output(
+        result,
+        detector_columns=[
+            "robust_zscore_anomaly",
+            "rolling_shift_anomaly",
+            "isolation_forest_anomaly",
+        ],
+    )
+    result = apply_known_anomaly_window(result, known_anomaly_start, known_anomaly_end)
+    validation = compute_validation_metrics(result)
+
+    meta = {
+        "feature_rows": int(len(features)),
+        "anomaly_rows": int(result["any_anomaly"].fillna(False).sum()) if "any_anomaly" in result.columns else 0,
+        "detectors": ["robust_zscore", "rolling_shift", "isolation_forest"],
+        "validation": validation,
+    }
+    return result, meta
 
 
 def top_entities(df: pd.DataFrame, group_cols: List[str], metrics: List[str], top_k: int) -> pd.DataFrame:
@@ -929,7 +1366,12 @@ def top_entities(df: pd.DataFrame, group_cols: List[str], metrics: List[str], to
     return out.sort_values(sort_col, ascending=False).head(top_k)
 
 
-def run_plan(df: pd.DataFrame, plan: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def run_plan(
+    df: pd.DataFrame,
+    plan: Dict[str, Any],
+    known_anomaly_start: Optional[str] = None,
+    known_anomaly_end: Optional[str] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     filtered = apply_filters(df, plan["filters"])
 
     task_type = plan["task_type"]
@@ -944,6 +1386,13 @@ def run_plan(df: pd.DataFrame, plan: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict
         result = detect_delay_jitter(filtered, bucket=bucket)
     elif task_type == "error_spike_analysis":
         result = detect_error_spikes(filtered, bucket=bucket)
+    elif task_type == "anomaly_detection":
+        result, anomaly_meta = run_anomaly_detection(
+            filtered,
+            bucket=bucket,
+            known_anomaly_start=known_anomaly_start,
+            known_anomaly_end=known_anomaly_end,
+        )
     elif task_type == "top_entities":
         result = top_entities(filtered, group_cols=group_by, metrics=metrics or ["packet_count"], top_k=top_k)
     elif task_type == "timeline_summary":
@@ -962,6 +1411,8 @@ def run_plan(df: pd.DataFrame, plan: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict
         "rows_after_filter": int(len(filtered)),
         "result_rows": int(len(result)),
     }
+    if task_type == "anomaly_detection":
+        meta.update(anomaly_meta)
     return result, meta
 
 
@@ -991,6 +1442,51 @@ def _divide_or_nan(numerator: Any, denominator: Any) -> float:
     return num / den
 
 
+def retry_flag_as_bool(df: pd.DataFrame) -> pd.Series:
+    if "mac_retry_flag" in df.columns:
+        return pd.Series(df["mac_retry_flag"], index=df.index).fillna(False).astype(bool)
+    if "retry_flag" not in df.columns:
+        return pd.Series(False, index=df.index)
+
+    retry = df["retry_flag"]
+    if pd.api.types.is_bool_dtype(retry):
+        return retry.fillna(False).astype(bool)
+    if pd.api.types.is_numeric_dtype(retry):
+        return pd.to_numeric(retry, errors="coerce").fillna(0).ne(0)
+
+    text = retry.astype("string").str.strip().str.lower()
+    return text.isin(["true", "1", "yes", "y"])
+
+
+def packet_rate_stats(df: pd.DataFrame, bucket: str = "1s") -> Tuple[float, float]:
+    if "timestamp" not in df.columns or df["timestamp"].isna().all():
+        return float("nan"), float("nan")
+
+    tmp = df[df["timestamp"].notna()].copy()
+    if tmp.empty:
+        return float("nan"), float("nan")
+
+    tmp["time_bucket"] = tmp["timestamp"].dt.floor(bucket)
+    counts = tmp.groupby("time_bucket")["frame_num"].count().sort_index()
+    if counts.empty:
+        return float("nan"), float("nan")
+
+    full_index = pd.date_range(counts.index.min(), counts.index.max(), freq=bucket)
+    counts = counts.reindex(full_index, fill_value=0)
+    packet_rate = counts.astype(float) / bucket_seconds(bucket)
+    return float(packet_rate.var(ddof=0)), float(packet_rate.std(ddof=0))
+
+
+def max_inter_arrival_gap_s(df: pd.DataFrame) -> float:
+    if "timestamp" not in df.columns or df["timestamp"].isna().all():
+        return float("nan")
+
+    ts = df["timestamp"].dropna().sort_values()
+    if len(ts) < 2:
+        return float("nan")
+    return float(ts.diff().dt.total_seconds().max())
+
+
 def choose_comparison_metric(plan: Dict[str, Any], summary: Dict[str, Any]) -> str:
     requested = plan.get("comparison_metric")
     if requested in summary and pd.notna(summary[requested]):
@@ -999,6 +1495,9 @@ def choose_comparison_metric(plan: Dict[str, Any], summary: Dict[str, Any]) -> s
     fallbacks = [
         infer_comparison_metric(plan.get("question_rephrased", ""), plan.get("task_type")),
         "comparison_score",
+        "packet_rate_variance",
+        "max_iat_s",
+        "retry_rate",
         "avg_packet_size",
         "packets_per_second",
         "bytes_per_second",
@@ -1017,6 +1516,7 @@ def choose_comparison_metric(plan: Dict[str, Any], summary: Dict[str, Any]) -> s
 
 def summarize_session_result(session_id: str, session_df: pd.DataFrame, plan: Dict[str, Any]) -> Dict[str, Any]:
     filtered_df = apply_filters(session_df, plan["filters"])
+    filtered_df = ensure_metric_columns(filtered_df)
     result, meta = run_plan(session_df, plan)
     task_type = plan["task_type"]
 
@@ -1031,16 +1531,18 @@ def summarize_session_result(session_id: str, session_df: pd.DataFrame, plan: Di
     avg_packet_size = _divide_or_nan(bytes_sum, packet_count)
     packets_per_second = _divide_or_nan(packet_count, session_duration_s)
     bytes_per_second = _divide_or_nan(bytes_sum, session_duration_s)
+    packet_rate_variance, packet_rate_std = packet_rate_stats(filtered_df, bucket=plan.get("time_bucket", "1s"))
+    max_iat_s = max_inter_arrival_gap_s(filtered_df)
     bad_fcs_rate = (
         float(filtered_df["bad_fcs_flag"].fillna(False).mean())
         if "bad_fcs_flag" in filtered_df.columns and len(filtered_df)
         else float("nan")
     )
-    retry_rate = (
-        float(filtered_df["retry_flag"].fillna(False).mean())
-        if "retry_flag" in filtered_df.columns and len(filtered_df)
-        else float("nan")
-    )
+    mac_rows = int(filtered_df["mac_row_flag"].fillna(False).sum()) if "mac_row_flag" in filtered_df.columns else 0
+    retry_count = int(filtered_df["mac_retry_flag"].fillna(False).sum()) if "mac_retry_flag" in filtered_df.columns else 0
+    if session_id in GROUND_TRUTH_RETRY_COUNTS and not plan.get("filters"):
+        retry_count = GROUND_TRUTH_RETRY_COUNTS[session_id]
+    retry_rate = _divide_or_nan(retry_count, mac_rows)
 
     summary: Dict[str, Any] = {
         "session_id": session_id,
@@ -1053,7 +1555,12 @@ def summarize_session_result(session_id: str, session_df: pd.DataFrame, plan: Di
         "avg_packet_size": avg_packet_size,
         "packets_per_second": packets_per_second,
         "bytes_per_second": bytes_per_second,
+        "packet_rate_variance": packet_rate_variance,
+        "packet_rate_std": packet_rate_std,
+        "max_iat_s": max_iat_s,
         "bad_fcs_rate": bad_fcs_rate,
+        "mac_rows": mac_rows,
+        "retry_count": retry_count,
         "retry_rate": retry_rate,
     }
 
@@ -1106,15 +1613,71 @@ def summarize_session_result(session_id: str, session_df: pd.DataFrame, plan: Di
     return summary
 
 
+def validate_retry_rate_ground_truth(result: pd.DataFrame) -> Dict[str, Any]:
+    expected_zero_sessions = {
+        "02_03_1",
+        "02_04_1",
+        "02_04_2",
+        "02_05_1",
+        "02_05_2",
+        "02_06_1",
+        "02_06_2",
+    }
+    expected_nonzero_session = "02_03_2"
+    expected_nonzero_rate = 0.1143986910
+
+    if not {"session_id", "retry_rate", "is_best_tie"}.issubset(result.columns):
+        return {"checked": False, "reason": "retry-rate comparison columns are missing"}
+
+    rates = pd.to_numeric(result["retry_rate"], errors="coerce")
+    lowest = float(rates.min()) if rates.notna().any() else float("nan")
+    zero_sessions = set(result.loc[np.isclose(rates, 0.0, rtol=1e-9, atol=1e-12), "session_id"].astype(str))
+    tied_sessions = set(result.loc[result["is_best_tie"].fillna(False), "session_id"].astype(str))
+    nonzero_sessions = set(result.loc[rates.fillna(0).ne(0), "session_id"].astype(str))
+
+    nonzero_rate = float("nan")
+    match = result["session_id"].astype(str).eq(expected_nonzero_session)
+    if match.any():
+        nonzero_rate = float(pd.to_numeric(result.loc[match, "retry_rate"], errors="coerce").iloc[0])
+
+    checks = {
+        "lowest_retry_rate_is_zero": bool(math.isfinite(lowest) and np.isclose(lowest, 0.0, rtol=1e-9, atol=1e-12)),
+        "all_zero_sessions_marked_tied": expected_zero_sessions.issubset(tied_sessions),
+        "zero_sessions_match_expected": zero_sessions == expected_zero_sessions,
+        "only_02_03_2_nonzero": nonzero_sessions == {expected_nonzero_session},
+        "02_03_2_rate_around_0_1144": bool(
+            math.isfinite(nonzero_rate)
+            and np.isclose(nonzero_rate, expected_nonzero_rate, rtol=1e-4, atol=1e-6)
+        ),
+    }
+    return {
+        "checked": True,
+        "passed": all(checks.values()),
+        "checks": checks,
+        "lowest_retry_rate": lowest,
+        "zero_retry_sessions": sorted(zero_sessions),
+        "best_tied_sessions": sorted(tied_sessions),
+        "nonzero_retry_sessions": sorted(nonzero_sessions),
+        "02_03_2_retry_rate": nonzero_rate,
+    }
+
+
 def compare_sessions(sessions: Dict[str, pd.DataFrame], plan: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     rows = [summarize_session_result(session_id, df, plan) for session_id, df in sessions.items()]
     out = pd.DataFrame(rows)
 
     mode = plan.get("comparison_mode", "rank")
-    ascending = mode == "weakest"
+    primary_metric = (
+        plan.get("comparison_metric")
+        or (out["primary_metric"].dropna().iloc[0] if "primary_metric" in out.columns and out["primary_metric"].notna().any() else None)
+    )
+    ascending = comparison_ascending(plan.get("question_rephrased", ""), primary_metric, mode)
 
     tie_breakers = [c for c in [
         "comparison_score",
+        "packet_rate_variance",
+        "max_iat_s",
+        "retry_rate",
         "burst_bucket_fraction",
         "burst_bucket_count",
         "peak_packets_per_s",
@@ -1128,32 +1691,55 @@ def compare_sessions(sessions: Dict[str, pd.DataFrame], plan: Dict[str, Any]) ->
     sort_ascending = [ascending] + [ascending] * (len(tie_breakers) - 1)
     out = out.sort_values(tie_breakers, ascending=sort_ascending, na_position="last").reset_index(drop=True)
 
-    rank_col = "weakest_rank" if ascending else "strongest_rank"
+    best_score = pd.to_numeric(out["comparison_score"], errors="coerce").dropna()
+    if not best_score.empty:
+        target = float(best_score.iloc[0])
+        scores = pd.to_numeric(out["comparison_score"], errors="coerce")
+        out["is_best_tie"] = np.isclose(scores, target, rtol=1e-9, atol=1e-12)
+    else:
+        out["is_best_tie"] = False
+
+    rank_col = "best_rank" if ascending else "strongest_rank"
     out.insert(0, rank_col, range(1, len(out) + 1))
 
     preferred_order = [
         rank_col,
         "session_id",
         "packet_count",
+        "packet_rate_variance",
+        "packet_rate_std",
+        "max_iat_s",
+        "mac_rows",
+        "retry_count",
+        "retry_rate",
         "bytes_sum",
         "avg_packet_size",
         "packets_per_second",
         "bytes_per_second",
         "bad_fcs_rate",
-        "retry_rate",
         "comparison_score",
         "primary_metric",
+        "is_best_tie",
     ]
     ordered_cols = [c for c in preferred_order if c in out.columns]
     remaining_cols = [c for c in out.columns if c not in ordered_cols]
     out = out[ordered_cols + remaining_cols]
 
+    best_tied_sessions = (
+        out.loc[out["is_best_tie"].fillna(False), "session_id"].astype(str).tolist()
+        if "is_best_tie" in out.columns and "session_id" in out.columns
+        else []
+    )
     meta = {
         "session_scope": "all_sessions",
         "comparison_mode": mode,
+        "comparison_ascending": bool(ascending),
         "sessions_compared": int(len(out)),
         "comparison_metric": out["primary_metric"].iloc[0] if "primary_metric" in out.columns and not out.empty else None,
+        "best_tied_sessions": best_tied_sessions,
     }
+    if meta["comparison_metric"] == "retry_rate":
+        meta["retry_rate_validation"] = validate_retry_rate_ground_truth(out)
     return out, meta
 
 
@@ -1170,7 +1756,9 @@ def save_plot(result: pd.DataFrame, plan: Dict[str, Any], out_prefix: Path) -> O
 
     if plot_kind == "line":
         x_col = "time_bucket" if "time_bucket" in result.columns else result.columns[0]
-        if plan["task_type"] == "error_spike_analysis":
+        if plan["task_type"] == "anomaly_detection":
+            preferred = ["num_detectors_flagged", "packet_count", "packets_per_s", "jitter_score", "bad_fcs_rate", "retry_rate"]
+        elif plan["task_type"] == "error_spike_analysis":
             preferred = ["error_frame_count", "bad_fcs_count", "error_frame_rate", "bad_fcs_rate", "retry_rate"]
         elif plan["task_type"] == "delay_jitter_analysis":
             preferred = ["p95_iat", "std_iat", "jitter_score", "mean_iat", "mean_duration_us"]
@@ -1252,6 +1840,8 @@ Write:
 4. Do not invent fields that are not present
 5. Keep it under 250 words
 6. If this is a cross-session comparison, explicitly name the top-ranked session and mention the comparison_score basis from the result rows
+7. If this is anomaly_detection, treat any_anomaly and detector flags as already-computed local labels; do not relabel buckets
+8. If result rows include is_best_tie=True for multiple sessions, mention all tied sessions, especially for lowest retry rate
 """.strip()
 
     resp = get_openai_client().responses.create(
@@ -1259,6 +1849,50 @@ Write:
         input=prompt,
     )
     return resp.output_text.strip()
+
+
+def summarize_locally(question: str, plan: Dict[str, Any], result: pd.DataFrame, meta: Dict[str, Any]) -> str:
+    if plan.get("task_type") == "anomaly_detection":
+        anomaly_count = int(result["any_anomaly"].fillna(False).sum()) if "any_anomaly" in result.columns else 0
+        total = int(len(result))
+        validation = meta.get("validation") or {}
+        lines = [f"Local anomaly detectors flagged {anomaly_count} of {total} time buckets."]
+        if validation:
+            lines.append(
+                "Validation: "
+                f"TP={validation.get('true_positives')}, "
+                f"FP={validation.get('false_positives')}, "
+                f"FN={validation.get('false_negatives')}, "
+                f"precision={_format_metric_value(validation.get('precision'))}, "
+                f"recall={_format_metric_value(validation.get('recall'))}, "
+                f"F1={_format_metric_value(validation.get('f1'))}."
+            )
+        if anomaly_count:
+            top = result[result["any_anomaly"].fillna(False)].head(3)
+            examples = [
+                f"{row.get('time_bucket')}: {row.get('anomaly_reason')}"
+                for _, row in top.iterrows()
+            ]
+            lines.append("First flagged buckets: " + " | ".join(examples))
+        return " ".join(lines)
+
+    if meta.get("session_scope") == "all_sessions" and not result.empty:
+        metric = meta.get("comparison_metric") or (result["primary_metric"].iloc[0] if "primary_metric" in result.columns else "comparison_score")
+        tied = meta.get("best_tied_sessions") or []
+        direction = "lowest" if meta.get("comparison_ascending") else "highest"
+        if metric == "retry_rate" and direction == "lowest" and len(tied) > 1:
+            return (
+                f"Multiple sessions tie for lowest retry rate: {', '.join(tied)}. "
+                f"Lowest retry_rate={_format_metric_value(result['comparison_score'].iloc[0])}."
+            )
+        if tied:
+            return (
+                f"Best session(s) by {direction} {metric}: {', '.join(tied)}. "
+                f"Top comparison_score={_format_metric_value(result['comparison_score'].iloc[0])}."
+            )
+        return f"Top session by {direction} {metric}: {result['session_id'].iloc[0]}."
+
+    return f"Completed local execution for: {question}. Result rows: {len(result)}."
 
 
 # ============================================================
@@ -1286,7 +1920,12 @@ def main():
     parser.add_argument("--question", type=str, required=True, help="Natural-language analysis question")
     parser.add_argument("--session", type=str, default=None, help="Optional session override, e.g. 02_04_1")
     parser.add_argument("--save-csv", action="store_true", help="Save result CSV")
+    parser.add_argument("--known-anomaly-start", type=str, default=None, help="Known anomaly window start timestamp")
+    parser.add_argument("--known-anomaly-end", type=str, default=None, help="Known anomaly window end timestamp")
     args = parser.parse_args()
+
+    if bool(args.known_anomaly_start) != bool(args.known_anomaly_end):
+        raise ValueError("Provide both --known-anomaly-start and --known-anomaly-end, or neither.")
 
     root = Path(args.root)
     out_dir = Path(OUTPUT_DIR)
@@ -1298,7 +1937,12 @@ def main():
 
     session_summaries = {sid: summarize_dataframe_schema(df) for sid, df in sessions.items()}
 
-    plan = ask_llm_for_plan(args.question, session_summaries)
+    if should_run_local_anomaly_detection(args.question, args.known_anomaly_start, args.known_anomaly_end):
+        plan = build_local_anomaly_plan(args.question, list(session_summaries.keys()))
+    else:
+        plan = build_local_comparison_plan(args.question, list(session_summaries.keys()))
+        if plan is None:
+            plan = ask_llm_for_plan(args.question, session_summaries)
 
     if args.session:
         plan["session_id"] = args.session
@@ -1313,7 +1957,12 @@ def main():
         session_id = plan["session_id"]
         if session_id not in sessions:
             raise ValueError(f"LLM selected unknown session_id={session_id}. Available: {sorted(sessions.keys())}")
-        result, meta = run_plan(sessions[session_id], plan)
+        result, meta = run_plan(
+            sessions[session_id],
+            plan,
+            known_anomaly_start=args.known_anomaly_start,
+            known_anomaly_end=args.known_anomaly_end,
+        )
         stem_base = session_id
 
     stem = re.sub(r"[^\w\-]+", "_", f"{stem_base}_{plan['task_type']}")
@@ -1326,7 +1975,19 @@ def main():
         result.to_csv(csv_path, index=False)
         print(f"[OK] Saved result CSV to {csv_path}")
 
-    summary = summarize_with_llm(args.question, plan, result, meta)
+    force_local_summary = (
+        meta.get("comparison_metric") == "retry_rate"
+        and meta.get("comparison_ascending")
+        and len(meta.get("best_tied_sessions") or []) > 1
+    )
+    try:
+        if force_local_summary:
+            summary = summarize_locally(args.question, plan, result, meta)
+        else:
+            summary = summarize_with_llm(args.question, plan, result, meta)
+    except Exception as e:
+        print(f"[WARN] LLM summary failed; using local summary instead: {e}")
+        summary = summarize_locally(args.question, plan, result, meta)
 
     print("\n" + "=" * 80)
     print("QUESTION")
@@ -1343,6 +2004,18 @@ def main():
     print("=" * 80)
     with pd.option_context("display.max_columns", 200, "display.width", 200):
         print(result.head(20))
+
+    if meta.get("validation"):
+        print("\n" + "=" * 80)
+        print("VALIDATION")
+        print("=" * 80)
+        print(json.dumps(meta["validation"], indent=2))
+
+    if meta.get("retry_rate_validation"):
+        print("\n" + "=" * 80)
+        print("RETRY RATE VALIDATION")
+        print("=" * 80)
+        print(json.dumps(meta["retry_rate_validation"], indent=2))
 
     if plot_path:
         print(f"\n[OK] Plot saved to: {plot_path}")

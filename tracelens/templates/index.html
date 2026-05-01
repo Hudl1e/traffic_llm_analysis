@@ -627,6 +627,14 @@
       border-bottom: 1px solid var(--border);
       white-space: nowrap;
     }
+    thead .group-row th {
+      background: #090b12;
+      color: var(--primary);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      padding: 8px 12px;
+    }
     tbody tr {
       border-bottom: 1px solid var(--border)66;
       transition: background 0.15s;
@@ -1161,7 +1169,7 @@ function renderChart(plan, result) {
 
   const PREFERRED_BY_TASK = {
     error_spike_analysis:   ["error_frame_count","bad_fcs_count","error_frame_rate","bad_fcs_rate","retry_rate"],
-    delay_jitter_analysis:  ["p95_iat","std_iat","jitter_score","mean_iat","mean_duration_us"],
+    delay_jitter_analysis:  ["std_iat","jitter_score","p95_iat","mean_iat","mean_duration_us"],
   };
   const PREFERRED_BAR = ["comparison_score","avg_packet_size","packets_per_second","bytes_per_second",
                           "packet_count","bytes_sum","error_frame_count","bad_fcs_count","retry_count"];
@@ -1173,12 +1181,7 @@ function renderChart(plan, result) {
     const prefs = PREFERRED_BY_TASK[plan.task_type] || ["packet_count","packets_per_s","bytes_sum"];
     const yKey = prefs.find(k => keys.includes(k)) || keys[1] || keys[0];
 
-    const labels = result.map(r => {
-      const v = r[xKey];
-      if (!v) return "";
-      const d = new Date(v);
-      return isNaN(d) ? String(v) : d.toISOString().slice(11, 19);
-    });
+    const labels = result.map(r => formatTimeLabel(r[xKey]));
     const vals = result.map(r => r[yKey] ?? null);
     const isBurst = plan.task_type === "burst_detection";
 
@@ -1202,7 +1205,7 @@ function renderChart(plan, result) {
     });
   } else {
     const xKey = keys.includes("session_id") ? "session_id" : keys[0];
-    const yKey = PREFERRED_BAR.find(k => keys.includes(k)) || keys[keys.length - 1];
+    const yKey = selectBarYKey(plan, keys);
     chartInstance = new Chart(ctx, {
       type: "bar",
       data: {
@@ -1219,6 +1222,13 @@ function renderChart(plan, result) {
       options: chartOptions(yKey),
     });
   }
+}
+
+function selectBarYKey(plan, keys) {
+  if (plan.comparison_metric && keys.includes(plan.comparison_metric)) {
+    return plan.comparison_metric;
+  }
+  return PREFERRED_BAR.find(k => keys.includes(k)) || keys[keys.length - 1];
 }
 
 function chartOptions(yKey) {
@@ -1264,10 +1274,27 @@ function fmtNum(v) {
   return n.toFixed(3).replace(/\.?0+$/, "");
 }
 
+function formatTimeLabel(v) {
+  if (!v) return "";
+  const text = String(v);
+
+  // Preserve trace timestamps exactly as emitted by pandas, e.g.
+  // "2026-02-04 16:55:46" or "2026-02-04T16:55:46".
+  // Parsing with Date + toISOString shifts these local capture times to UTC.
+  const match = text.match(/^\d{4}-\d{2}-\d{2}[ T](\d{2}:\d{2}:\d{2})/);
+  if (match) return match[1];
+
+  const d = new Date(text);
+  if (isNaN(d)) return text;
+  return d.toLocaleTimeString([], { hour12: false });
+}
+
 function renderTable(rows) {
   if (!rows.length) { tableWrap.innerHTML = "<p style='padding:16px;color:var(--text-dim);font-size:13px;'>No rows returned.</p>"; return; }
   const cols = Object.keys(rows[0]);
-  const thead = `<thead><tr>${cols.map(c => `<th>${c}</th>`).join("")}</tr></thead>`;
+  const groups = columnGroups(cols);
+  const groupRow = groups.map(g => `<th colspan="${g.span}">${g.label}</th>`).join("");
+  const thead = `<thead><tr class="group-row">${groupRow}</tr><tr>${cols.map(c => `<th>${c}</th>`).join("")}</tr></thead>`;
   const tbody = `<tbody>${rows.map(r => {
     const isBurst = r.is_burst === true;
     const isSpike = r.is_error_spike === true;
@@ -1277,14 +1304,38 @@ function renderTable(rows) {
         if (v === null || v === undefined) return `<td class="td-false">—</td>`;
         if (typeof v === "boolean") return `<td class="${v ? "td-true" : "td-false"}">${v}</td>`;
         if (typeof v === "number") return `<td class="td-number">${fmtNum(v)}</td>`;
-        if (typeof v === "string" && v.includes("T") && v.includes(":")) {
-          return `<td>${v.slice(11, 19)}</td>`;
+        if (typeof v === "string" && /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/.test(v)) {
+          return `<td>${formatTimeLabel(v)}</td>`;
         }
         return `<td>${v}</td>`;
       }).join("")}
     </tr>`;
   }).join("")}</tbody>`;
   tableWrap.innerHTML = `<table>${thead}${tbody}</table>`;
+}
+
+function columnGroups(cols) {
+  const groups = [];
+  cols.forEach(col => {
+    const label = columnGroupLabel(col);
+    const last = groups[groups.length - 1];
+    if (last && last.label === label) last.span += 1;
+    else groups.push({ label, span: 1 });
+  });
+  return groups;
+}
+
+function columnGroupLabel(col) {
+  if (col === "time_bucket" || col === "session_id" || col.endsWith("_rank")) return "scope";
+  if (["packet_count","packets_per_s","bytes_sum","frame_size_bytes","data_frame_count","mac_rows","rows_after_filter","result_rows"].includes(col)) return "volume";
+  if (["std_iat","jitter_score","p95_iat","mean_iat","mean_flow_iat","mean_global_iat","mean_duration_us","max_iat_s"].includes(col)) return "delay / jitter";
+  if (["mean_signal_dbm","mean_rate_mbps","avg_packet_size","packets_per_second","bytes_per_second"].includes(col)) return "link / rate";
+  if (col.includes("error") || col.includes("bad_fcs")) return "errors";
+  if (col.includes("retry")) return "retry";
+  if (col.includes("source_addr") || col.includes("destination_addr") || col.includes("bssid") || col.includes("channel")) return "devices";
+  if (col.startsWith("is_") || col.endsWith("_flag") || col.includes("anomaly")) return "flags";
+  if (col.includes("comparison") || col.includes("primary_metric")) return "comparison";
+  return "other";
 }
 </script>
 </body>

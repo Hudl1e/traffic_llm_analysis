@@ -611,6 +611,14 @@ def choose_default_session(session_ids: List[str]) -> str:
     return sorted(session_ids)[-1]
 
 
+def choose_session_for_question(question: str, session_ids: List[str]) -> str:
+    q = question.lower()
+    for session_id in sorted(session_ids, key=len, reverse=True):
+        if session_id.lower() in q:
+            return session_id
+    return choose_default_session(session_ids)
+
+
 def infer_cross_session_mode(question: str) -> Optional[str]:
     q = question.lower()
     mentions_session_compare = any(
@@ -636,6 +644,9 @@ def infer_cross_session_mode(question: str) -> Optional[str]:
 
 def infer_comparison_metric(question: str, task_type: Optional[str] = None) -> Optional[str]:
     q = question.lower()
+
+    if "burst" in q or "bursty" in q:
+        return "peak_burst_z"
 
     if ("stable" in q or "stability" in q) and any(term in q for term in ["traffic", "pattern", "packet rate"]):
         return "packet_rate_variance"
@@ -690,6 +701,8 @@ def comparison_ascending(question: str, metric: Optional[str], mode: str) -> boo
         return True
     if metric == "max_iat_s":
         return False
+    if metric == "peak_burst_z":
+        return mode == "weakest" or any(word in q for word in ["weakest", "lowest", "least", "smallest"])
     if metric == "retry_rate" and any(word in q for word in ["lowest", "least", "minimum", "min", "best"]):
         return True
 
@@ -706,9 +719,15 @@ def should_run_local_anomaly_detection(question: str, known_start: Optional[str]
     return bool(known_start or known_end or any(term in q for term in anomaly_terms))
 
 
+def should_run_local_burst_dominance(question: str) -> bool:
+    q = question.lower()
+    dominance_terms = ["dominate", "dominant", "top", "which channels", "which devices", "devices", "channel"]
+    return "burst" in q and any(term in q for term in dominance_terms)
+
+
 def build_local_anomaly_plan(question: str, session_ids: List[str]) -> Dict[str, Any]:
     return {
-        "session_id": choose_default_session(session_ids),
+        "session_id": choose_session_for_question(question, session_ids),
         "task_type": "anomaly_detection",
         "time_bucket": "1s",
         "group_by": [],
@@ -724,23 +743,43 @@ def build_local_anomaly_plan(question: str, session_ids: List[str]) -> Dict[str,
     }
 
 
+def build_local_burst_dominance_plan(question: str, session_ids: List[str]) -> Dict[str, Any]:
+    return {
+        "session_id": choose_session_for_question(question, session_ids),
+        "task_type": "burst_detection",
+        "time_bucket": "1s",
+        "group_by": [],
+        "filters": [],
+        "metrics": ["packet_count", "bytes_sum"],
+        "top_k": 20,
+        "plot": "line",
+        "question_rephrased": question,
+        "explanation_focus": ["bursty_traffic", "protocol_behavior", "link_quality"],
+        "session_scope": "single_session",
+        "comparison_mode": "none",
+        "comparison_metric": None,
+    }
+
+
 def build_local_comparison_plan(question: str, session_ids: List[str]) -> Optional[Dict[str, Any]]:
     comparison_mode = infer_cross_session_mode(question)
     if not comparison_mode:
         return None
 
     metric = infer_comparison_metric(question)
-    if metric not in {"packet_rate_variance", "max_iat_s", "retry_rate"}:
+    if metric not in {"packet_rate_variance", "max_iat_s", "retry_rate", "peak_burst_z"}:
         return None
 
     ascending = comparison_ascending(question, metric, comparison_mode)
+    task_type = "burst_detection" if metric == "peak_burst_z" else "timeline_summary"
+    metrics = ["packet_count", "bytes_sum"] if metric == "peak_burst_z" else ["packet_count", "retry_rate"]
     return {
         "session_id": "ALL_SESSIONS",
-        "task_type": "timeline_summary",
+        "task_type": task_type,
         "time_bucket": "1s",
         "group_by": [],
         "filters": [],
-        "metrics": ["packet_count", "retry_rate"],
+        "metrics": metrics,
         "top_k": 20,
         "plot": "bar",
         "question_rephrased": question,
@@ -767,6 +806,7 @@ Rules:
 - Prefer packet_count, bytes_sum, mean_iat, std_iat, p95_iat for burst/delay/jitter questions
 - Prefer bad_fcs_count, bad_fcs_rate, error_frame_count, retry_rate, or error_frame_rate for error questions
 - Prefer anomaly_detection for explicit anomaly-detector or known-anomaly validation questions
+- For questions asking which channels or devices dominate during bursts, use burst_detection; its result includes dominant_channel plus dominant_source_addr, dominant_destination_addr, and dominant_bssid fields when those columns exist. source_addr is derived from Transmit Addr and destination_addr from Receive Addr.
 - Prefer line plot for time-series questions, bar plot for top-k questions
 - Keep the plan simple and executable locally with pandas
 - group_by may be empty or use concrete columns like source_addr, destination_addr, bssid, mac_type, mac_subtype, channel, or UDP ports if present
@@ -969,6 +1009,54 @@ def bucket_seconds(bucket: str) -> float:
     return float(m.group(1)) if m else 1.0
 
 
+def order_existing_columns(df: pd.DataFrame, preferred_order: List[str]) -> pd.DataFrame:
+    ordered = [c for c in preferred_order if c in df.columns]
+    remaining = [c for c in df.columns if c not in ordered]
+    return df[ordered + remaining]
+
+
+def top_value_stats(group: pd.DataFrame, column: str) -> Dict[str, Any]:
+    values = group[column].dropna()
+    if values.empty:
+        return {
+            f"{column}_known_count": 0,
+            f"dominant_{column}": None,
+            f"dominant_{column}_packet_count": 0,
+            f"dominant_{column}_packet_share": np.nan,
+        }
+
+    counts = values.value_counts(dropna=True)
+    top_value = counts.index[0]
+    if hasattr(top_value, "item"):
+        top_value = top_value.item()
+    top_count = int(counts.iloc[0])
+    return {
+        f"{column}_known_count": int(len(values)),
+        f"dominant_{column}": top_value,
+        f"dominant_{column}_packet_count": top_count,
+        f"dominant_{column}_packet_share": float(top_count / len(values)) if len(values) else np.nan,
+    }
+
+
+def add_dominant_traffic_fields(bucketed: pd.DataFrame, result: pd.DataFrame) -> pd.DataFrame:
+    dominant_columns = [
+        c for c in ["channel", "source_addr", "destination_addr", "bssid"]
+        if c in bucketed.columns
+    ]
+    if not dominant_columns:
+        return result
+
+    rows = []
+    for time_bucket, group in bucketed.groupby("time_bucket", dropna=False):
+        row: Dict[str, Any] = {"time_bucket": time_bucket}
+        for column in dominant_columns:
+            row.update(top_value_stats(group, column))
+        rows.append(row)
+
+    dominant = pd.DataFrame(rows)
+    return result.merge(dominant, on="time_bucket", how="left")
+
+
 def detect_bursts(df: pd.DataFrame, bucket: str) -> pd.DataFrame:
     b = bucket_time(ensure_metric_columns(df), bucket)
     g = b.groupby("time_bucket", dropna=False).agg(
@@ -997,6 +1085,7 @@ def detect_bursts(df: pd.DataFrame, bucket: str) -> pd.DataFrame:
         g["burst_z"] = 0.0
 
     g["is_burst"] = g["burst_z"] >= 2.0
+    g = add_dominant_traffic_fields(b, g)
     return g
 
 
@@ -1025,7 +1114,27 @@ def detect_delay_jitter(df: pd.DataFrame, bucket: str) -> pd.DataFrame:
     g["retry_rate"] = g["retry_count"] / g["mac_rows"].replace(0, np.nan)
     g["bad_fcs_rate"] = g["bad_fcs_count"] / g["packet_count"].replace(0, np.nan)
     g["error_frame_rate"] = g["error_frame_count"] / g["packet_count"].replace(0, np.nan)
-    return g
+    return order_existing_columns(g, [
+        "time_bucket",
+        "packet_count",
+        "std_iat",
+        "jitter_score",
+        "p95_iat",
+        "mean_iat",
+        "mean_flow_iat",
+        "mean_global_iat",
+        "mean_duration_us",
+        "mean_signal_dbm",
+        "mean_rate_mbps",
+        "error_frame_count",
+        "error_frame_rate",
+        "bad_fcs_count",
+        "bad_fcs_rate",
+        "retry_count",
+        "retry_rate",
+        "mac_rows",
+        "data_frame_count",
+    ])
 
 
 def detect_error_spikes(df: pd.DataFrame, bucket: str) -> pd.DataFrame:
@@ -1487,6 +1596,27 @@ def max_inter_arrival_gap_s(df: pd.DataFrame) -> float:
     return float(ts.diff().dt.total_seconds().max())
 
 
+def jitter_summary_stats(df: pd.DataFrame, bucket: str = "1s") -> Dict[str, float]:
+    try:
+        jitter = detect_delay_jitter(df, bucket=bucket)
+    except Exception:
+        return {
+            "jitter_score": float("nan"),
+            "peak_jitter_score": float("nan"),
+            "peak_std_iat": float("nan"),
+            "peak_p95_iat": float("nan"),
+            "mean_std_iat": float("nan"),
+        }
+
+    return {
+        "jitter_score": _safe_max(jitter["jitter_score"]) if "jitter_score" in jitter.columns else float("nan"),
+        "peak_jitter_score": _safe_max(jitter["jitter_score"]) if "jitter_score" in jitter.columns else float("nan"),
+        "peak_std_iat": _safe_max(jitter["std_iat"]) if "std_iat" in jitter.columns else float("nan"),
+        "peak_p95_iat": _safe_max(jitter["p95_iat"]) if "p95_iat" in jitter.columns else float("nan"),
+        "mean_std_iat": _safe_mean(jitter["std_iat"]) if "std_iat" in jitter.columns else float("nan"),
+    }
+
+
 def choose_comparison_metric(plan: Dict[str, Any], summary: Dict[str, Any]) -> str:
     requested = plan.get("comparison_metric")
     if requested in summary and pd.notna(summary[requested]):
@@ -1533,6 +1663,7 @@ def summarize_session_result(session_id: str, session_df: pd.DataFrame, plan: Di
     bytes_per_second = _divide_or_nan(bytes_sum, session_duration_s)
     packet_rate_variance, packet_rate_std = packet_rate_stats(filtered_df, bucket=plan.get("time_bucket", "1s"))
     max_iat_s = max_inter_arrival_gap_s(filtered_df)
+    jitter_stats = jitter_summary_stats(filtered_df, bucket=plan.get("time_bucket", "1s"))
     bad_fcs_rate = (
         float(filtered_df["bad_fcs_flag"].fillna(False).mean())
         if "bad_fcs_flag" in filtered_df.columns and len(filtered_df)
@@ -1558,6 +1689,7 @@ def summarize_session_result(session_id: str, session_df: pd.DataFrame, plan: Di
         "packet_rate_variance": packet_rate_variance,
         "packet_rate_std": packet_rate_std,
         "max_iat_s": max_iat_s,
+        **jitter_stats,
         "bad_fcs_rate": bad_fcs_rate,
         "mac_rows": mac_rows,
         "retry_count": retry_count,
@@ -1573,11 +1705,11 @@ def summarize_session_result(session_id: str, session_df: pd.DataFrame, plan: Di
             "mean_bad_fcs_rate": _safe_mean(result["bad_fcs_rate"]) if "bad_fcs_rate" in result.columns else float("nan"),
             "mean_retry_rate": _safe_mean(result["retry_rate"]) if "retry_rate" in result.columns else float("nan"),
         })
-        summary["jitter_score"] = float("nan")
         summary["peak_error_z"] = float("nan")
     elif task_type == "delay_jitter_analysis":
         summary.update({
             "peak_jitter_score": _safe_max(result["jitter_score"]) if "jitter_score" in result.columns else float("nan"),
+            "peak_std_iat": _safe_max(result["std_iat"]) if "std_iat" in result.columns else float("nan"),
             "peak_p95_iat": _safe_max(result["p95_iat"]) if "p95_iat" in result.columns else float("nan"),
             "peak_mean_iat": _safe_max(result["mean_iat"]) if "mean_iat" in result.columns else float("nan"),
             "mean_bad_fcs_rate": _safe_mean(result["bad_fcs_rate"]) if "bad_fcs_rate" in result.columns else float("nan"),
@@ -1709,6 +1841,11 @@ def compare_sessions(sessions: Dict[str, pd.DataFrame], plan: Dict[str, Any]) ->
         "packet_rate_variance",
         "packet_rate_std",
         "max_iat_s",
+        "jitter_score",
+        "peak_jitter_score",
+        "peak_std_iat",
+        "peak_p95_iat",
+        "mean_std_iat",
         "mac_rows",
         "retry_count",
         "retry_rate",
@@ -1761,7 +1898,7 @@ def save_plot(result: pd.DataFrame, plan: Dict[str, Any], out_prefix: Path) -> O
         elif plan["task_type"] == "error_spike_analysis":
             preferred = ["error_frame_count", "bad_fcs_count", "error_frame_rate", "bad_fcs_rate", "retry_rate"]
         elif plan["task_type"] == "delay_jitter_analysis":
-            preferred = ["p95_iat", "std_iat", "jitter_score", "mean_iat", "mean_duration_us"]
+            preferred = ["std_iat", "jitter_score", "p95_iat", "mean_iat", "mean_duration_us"]
         else:
             preferred = ["packet_count", "packets_per_s", "bytes_sum", "data_frame_count"]
         y_candidates = [c for c in preferred if c in result.columns]
@@ -1776,11 +1913,13 @@ def save_plot(result: pd.DataFrame, plan: Dict[str, Any], out_prefix: Path) -> O
 
     elif plot_kind == "bar":
         x_col = "session_id" if "session_id" in result.columns else result.columns[0]
-        y_candidates = [c for c in [
+        preferred = [
+            plan.get("comparison_metric"),
             "comparison_score", "avg_packet_size", "packets_per_second", "bytes_per_second",
             "packet_count", "bytes_sum", "error_frame_count", "bad_fcs_count",
             "retry_count", "bad_fcs_rate", "error_frame_rate", "retry_rate"
-        ] if c in result.columns]
+        ]
+        y_candidates = [c for c in preferred if c and c in result.columns]
         if not y_candidates:
             return None
         y_col = y_candidates[0]
@@ -1818,6 +1957,14 @@ def summarize_with_llm(
     result: pd.DataFrame,
     meta: Dict[str, Any],
 ) -> str:
+    preview_df = result
+    if plan.get("task_type") == "burst_detection" and {"is_burst", "burst_z"}.issubset(result.columns):
+        preview_df = result.sort_values(["is_burst", "burst_z"], ascending=[False, False])
+    elif plan.get("task_type") == "error_spike_analysis" and {"is_error_spike", "error_z"}.issubset(result.columns):
+        preview_df = result.sort_values(["is_error_spike", "error_z"], ascending=[False, False])
+    elif plan.get("task_type") == "delay_jitter_analysis" and "std_iat" in result.columns:
+        preview_df = result.sort_values("std_iat", ascending=False, na_position="last")
+
     prompt = f"""
 You are writing a short network-traffic analysis summary for a class project.
 
@@ -1831,7 +1978,7 @@ Execution metadata:
 {json.dumps(meta, indent=2)}
 
 Top result rows:
-{json.dumps(df_preview_for_llm(result, max_rows=20), indent=2)}
+{json.dumps(df_preview_for_llm(preview_df, max_rows=20), indent=2)}
 
 Write:
 1. A short answer to the question
@@ -1839,9 +1986,12 @@ Write:
 3. If anomalies appear, add a compact incident-style explanation with likely causes
 4. Do not invent fields that are not present
 5. Keep it under 250 words
-6. If this is a cross-session comparison, explicitly name the top-ranked session and mention the comparison_score basis from the result rows
+6. If this is a cross-session comparison, explicitly name the top-ranked session and mention the comparison_metric / primary_metric basis from the result rows. Prefer the named metric column, such as peak_burst_z, over the generic comparison_score alias.
 7. If this is anomaly_detection, treat any_anomaly and detector flags as already-computed local labels; do not relabel buckets
 8. If result rows include is_best_tie=True for multiple sessions, mention all tied sessions, especially for lowest retry rate
+9. If burst_detection rows include dominant_* fields, use them to identify dominant channels/devices; source_addr comes from Transmit Addr and destination_addr comes from Receive Addr.
+10. If this is error_spike_analysis, base the answer on the highest error_z / is_error_spike rows first, then discuss whether their mean_signal_dbm or mean_rate_mbps values support the user's association question.
+11. If this is delay_jitter_analysis, use std_iat as the primary "jitter over time" metric because the UI chart plots std_iat; use jitter_score and p95_iat only as supporting context.
 """.strip()
 
     resp = get_openai_client().responses.create(
@@ -1939,6 +2089,8 @@ def main():
 
     if should_run_local_anomaly_detection(args.question, args.known_anomaly_start, args.known_anomaly_end):
         plan = build_local_anomaly_plan(args.question, list(session_summaries.keys()))
+    elif should_run_local_burst_dominance(args.question):
+        plan = build_local_burst_dominance_plan(args.question, list(session_summaries.keys()))
     else:
         plan = build_local_comparison_plan(args.question, list(session_summaries.keys()))
         if plan is None:

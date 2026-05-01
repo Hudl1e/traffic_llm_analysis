@@ -277,6 +277,131 @@
     .feature-card h3 { font-size: 13px; font-weight: 700; margin-bottom: 6px; }
     .feature-card p { font-size: 12px; color: var(--text-dim); line-height: 1.6; }
 
+    /* ─── Metrics Reference Panel ───────────────────────────── */
+    .metrics-panel {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      margin-bottom: 24px;
+      overflow: hidden;
+    }
+    .metrics-panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 20px;
+      cursor: pointer;
+      user-select: none;
+      border-bottom: 1px solid transparent;
+      transition: border-color 0.2s, background 0.2s;
+    }
+    .metrics-panel-header:hover { background: var(--primary-dim); border-bottom-color: var(--border); }
+    .metrics-panel-header.open { border-bottom-color: var(--border); }
+    .metrics-panel-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .metrics-panel-title svg { width: 16px; height: 16px; color: var(--primary); }
+    .metrics-panel-subtitle {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--text-dim);
+      margin-top: 2px;
+    }
+    .metrics-chevron {
+      width: 16px; height: 16px;
+      color: var(--text-dim);
+      transition: transform 0.25s;
+    }
+    .metrics-chevron.open { transform: rotate(180deg); }
+    .metrics-body {
+      display: none;
+      padding: 20px;
+    }
+    .metrics-body.open { display: block; }
+
+    /* Category tabs */
+    .metrics-tabs {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-bottom: 20px;
+    }
+    .metrics-tab {
+      padding: 5px 14px;
+      border-radius: 100px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-dim);
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .metrics-tab:hover { border-color: var(--primary)66; color: var(--primary); }
+    .metrics-tab.active {
+      background: var(--primary-dim);
+      border-color: var(--primary)88;
+      color: var(--primary);
+    }
+
+    /* Formula grid */
+    .formula-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 10px;
+    }
+    .formula-card {
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 12px 14px;
+      background: var(--bg);
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .formula-card:hover {
+      border-color: var(--primary)55;
+      box-shadow: 0 0 12px #2a6fff18;
+    }
+    .formula-name {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--accent);
+      font-weight: 700;
+      margin-bottom: 5px;
+    }
+    .formula-expr {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--primary);
+      background: var(--primary-dim);
+      padding: 4px 8px;
+      border-radius: 4px;
+      margin-bottom: 6px;
+      word-break: break-all;
+      line-height: 1.5;
+    }
+    .formula-desc {
+      font-size: 11px;
+      color: var(--text-dim);
+      line-height: 1.5;
+    }
+    .formula-tag {
+      display: inline-block;
+      margin-top: 6px;
+      padding: 2px 8px;
+      border-radius: 100px;
+      font-size: 10px;
+      font-family: var(--font-mono);
+    }
+    .tag-burstiness  { background: #2a6fff18; color: #2a6fff; border: 1px solid #2a6fff33; }
+    .tag-delay       { background: #00e5c011; color: #00e5c0; border: 1px solid #00e5c033; }
+    .tag-error       { background: #ff4b6e18; color: #ff4b6e; border: 1px solid #ff4b6e33; }
+    .tag-throughput  { background: #a855f718; color: #c084fc; border: 1px solid #a855f733; }
+
     /* ─── Loaded state ──────────────────────────────────────── */
     #loaded-view { display: none; }
 
@@ -637,6 +762,30 @@
 
       <div class="session-strip" id="session-strip"></div>
 
+      <!-- ── Metrics Reference Panel ─────────────────────── -->
+      <div class="metrics-panel" id="metrics-panel">
+        <div class="metrics-panel-header" id="metrics-toggle" onclick="toggleMetrics()">
+          <div>
+            <div class="metrics-panel-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 20h20M6 20V10M12 20V4M18 20v-6"/></svg>
+              Available Metric Formulas
+            </div>
+            <div class="metrics-panel-subtitle">30 formulas · 4 categories · click to explore</div>
+          </div>
+          <svg class="metrics-chevron" id="metrics-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+        </div>
+        <div class="metrics-body" id="metrics-body">
+          <div class="metrics-tabs" id="metrics-tabs">
+            <button class="metrics-tab active" onclick="filterMetrics('all', this)">All (30)</button>
+            <button class="metrics-tab" onclick="filterMetrics('throughput', this)">📦 Throughput &amp; Volume</button>
+            <button class="metrics-tab" onclick="filterMetrics('burstiness', this)">⚡ Burstiness</button>
+            <button class="metrics-tab" onclick="filterMetrics('delay', this)">⏱ Delay &amp; Jitter</button>
+            <button class="metrics-tab" onclick="filterMetrics('error', this)">🔴 Errors &amp; Retries</button>
+          </div>
+          <div class="formula-grid" id="formula-grid"></div>
+        </div>
+      </div>
+
       <div class="question-card">
         <div class="question-label">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a10 10 0 110 20 10 10 0 010-20z"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
@@ -829,6 +978,79 @@ function showLoadedState() {
   );
 }
 
+// ─── Metrics Panel ─────────────────────────────────────────
+const FORMULAS = [
+  // Throughput & Volume
+  { name: "packet_count",       expr: "COUNT(frames)",                                                      desc: "Number of captured frames in the selected group or time bucket.",                                              cat: "throughput" },
+  { name: "bytes_sum",          expr: "Σ frame_size_bytes",                                                  desc: "Total bytes transferred across all captured frames.",                                                         cat: "throughput" },
+  { name: "avg_packet_size",    expr: "bytes_sum / packet_count",                                            desc: "Average size of each packet in bytes.",                                                                       cat: "throughput" },
+  { name: "session_duration_s", expr: "max(timestamp) − min(timestamp)",                                     desc: "Wall-clock duration from the first to the last frame in the session.",                                         cat: "throughput" },
+  { name: "packets_per_second", expr: "packet_count / session_duration_s",                                   desc: "Overall packet rate for the entire session.",                                                                 cat: "throughput" },
+  { name: "bytes_per_second",   expr: "bytes_sum / session_duration_s",                                      desc: "Overall byte throughput rate for the entire session.",                                                        cat: "throughput" },
+  { name: "data_frame_count",   expr: "Σ data_frame_flag",                                                   desc: "Count of frames classified as data frames (vs. management/control).",                                         cat: "throughput" },
+  { name: "mean_signal_dbm",    expr: "mean(signal_dbm)",                                                    desc: "Average received signal strength across all frames.",                                                         cat: "throughput" },
+  { name: "mean_rate_mbps",     expr: "mean(data_rate_mbps)",                                                desc: "Average PHY data rate across all frames.",                                                                    cat: "throughput" },
+  // Burstiness
+  { name: "packets_per_s",      expr: "packet_count / bucket_seconds",                                       desc: "Instantaneous packet rate within each time bucket.",                                                          cat: "burstiness" },
+  { name: "burst_z",            expr: "(packet_count − μ_buckets) / σ_buckets",                              desc: "Z-score of packet count in a bucket versus the session mean. Values ≥ 2 indicate a burst.",                    cat: "burstiness" },
+  { name: "is_burst",           expr: "burst_z ≥ 2.0",                                                      desc: "True when the bucket's packet-count z-score reaches the burst threshold.",                                    cat: "burstiness" },
+  // Delay & Jitter (IAT)
+  { name: "iat_s",              expr: "timestamp(t) − timestamp(t−1)",                                       desc: "Global inter-arrival time between consecutive frames.",                                                       cat: "delay" },
+  { name: "flow_iat_s",         expr: "timestamp(t) − prev_timestamp[flow_key]",                             desc: "Inter-arrival time between frames belonging to the same flow (src/dst MAC pair).",                           cat: "delay" },
+  { name: "analysis_iat_s",     expr: "flow_iat_s if available, else iat_s",                                 desc: "Best available IAT: flow-level when a flow key exists, global otherwise.",                                   cat: "delay" },
+  { name: "mean_iat",           expr: "mean(analysis_iat_s)",                                                desc: "Mean inter-arrival time — average gap between packets.",                                                     cat: "delay" },
+  { name: "std_iat",            expr: "std(analysis_iat_s)",                                                 desc: "Standard deviation of IAT — captures variability in packet spacing.",                                        cat: "delay" },
+  { name: "p95_iat",            expr: "percentile_95(analysis_iat_s)",                                       desc: "95th-percentile IAT — worst-case delay excluding outliers.",                                                 cat: "delay" },
+  { name: "mean_duration_us",   expr: "mean(duration_us)",                                                   desc: "Mean frame transmission duration in microseconds.",                                                          cat: "delay" },
+  { name: "jitter_score",       expr: "std_iat / (mean_iat + 1e-9)",                                         desc: "Normalized jitter: std IAT divided by mean IAT. Higher = more irregular packet spacing.",                      cat: "delay" },
+  // Errors & Retries
+  { name: "bad_fcs_count",      expr: "Σ bad_fcs_flag",                                                      desc: "Number of frames with a bad Frame Check Sequence (CRC error).",                                              cat: "error" },
+  { name: "bad_fcs_rate",       expr: "bad_fcs_count / packet_count",                                        desc: "Fraction of frames with bad FCS. ≥ 0.20 triggers an error spike flag.",                                      cat: "error" },
+  { name: "error_frame_count",  expr: "Σ has_error_row",                                                     desc: "Number of frames that have an associated error record.",                                                      cat: "error" },
+  { name: "error_frame_rate",   expr: "error_frame_count / packet_count",                                    desc: "Fraction of frames that are error frames.",                                                                  cat: "error" },
+  { name: "retry_count",        expr: "Σ retry_flag",                                                        desc: "Number of frames with the 802.11 retry bit set.",                                                            cat: "error" },
+  { name: "retry_rate",         expr: "retry_count / packet_count",                                          desc: "Fraction of frames that are retransmissions.",                                                               cat: "error" },
+  { name: "error_z",            expr: "(error_frame_count − μ_buckets) / σ_buckets",                         desc: "Z-score of error frame count in a bucket. High values flag error spikes.",                                    cat: "error" },
+  { name: "is_error_spike",     expr: "error_z ≥ 2.0 OR bad_fcs_rate ≥ 0.20",                               desc: "True when either the error z-score is extreme or bad-FCS rate crosses the threshold.",                        cat: "error" },
+];
+
+const TAG_LABELS = { throughput: "throughput", burstiness: "burstiness", delay: "delay", error: "error" };
+const TAG_CLASS  = { throughput: "tag-throughput", burstiness: "tag-burstiness", delay: "tag-delay", error: "tag-error" };
+
+let currentMetricFilter = "all";
+
+function toggleMetrics() {
+  const body    = document.getElementById("metrics-body");
+  const chevron = document.getElementById("metrics-chevron");
+  const header  = document.getElementById("metrics-toggle");
+  const open    = body.classList.toggle("open");
+  chevron.classList.toggle("open", open);
+  header.classList.toggle("open", open);
+  if (open && document.getElementById("formula-grid").innerHTML === "") {
+    renderFormulas("all");
+  }
+}
+
+function filterMetrics(cat, btn) {
+  currentMetricFilter = cat;
+  document.querySelectorAll(".metrics-tab").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+  renderFormulas(cat);
+}
+
+function renderFormulas(cat) {
+  const grid = document.getElementById("formula-grid");
+  const list = cat === "all" ? FORMULAS : FORMULAS.filter(f => f.cat === cat);
+  grid.innerHTML = list.map(f => `
+    <div class="formula-card">
+      <div class="formula-name">${f.name}</div>
+      <div class="formula-expr">${f.expr}</div>
+      <div class="formula-desc">${f.desc}</div>
+      <span class="formula-tag ${TAG_CLASS[f.cat]}">${TAG_LABELS[f.cat]}</span>
+    </div>
+  `).join("");
+}
+
 // ─── Clear ─────────────────────────────────────────────────
 clearBtn.addEventListener("click", async () => {
   await fetch("/api/clear", { method: "POST", headers: apiHeaders() });
@@ -839,6 +1061,11 @@ clearBtn.addEventListener("click", async () => {
   resultsEl.style.display  = "none";
   analyzeError.classList.remove("visible");
   questionIn.value = "";
+  // Reset metrics panel
+  document.getElementById("metrics-body").classList.remove("open");
+  document.getElementById("metrics-chevron").classList.remove("open");
+  document.getElementById("metrics-toggle").classList.remove("open");
+  document.getElementById("formula-grid").innerHTML = "";
 });
 
 // ─── Analyze ───────────────────────────────────────────────

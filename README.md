@@ -36,3 +36,23 @@ TRAFFIC_LLM_ANALYSIS/
 │   └── requirements.txt        # Web app dependencies
 ├── traffic_llm_pipeline.py     # Main Python analysis pipeline
 └── README.md
+```
+
+## Running the command-line LLM pipeline
+
+You can also run the LLM analysis directly from the terminal without using the website.
+First, set your OpenAI API key. Then run the pipeline with a dataset folder and a natural-language question
+
+```bash
+export OPENAI_API_KEY=""
+python traffic_llm_pipeline.py --root dataset --question "Which session has the strongest bursty traffic pattern?"
+```
+
+Or start the TraceLens website:
+
+```bash
+cd tracelens
+pip install -r requirements.txt
+export OPENAI_API_KEY=""
+flask --app app run --debug --port 5000
+```

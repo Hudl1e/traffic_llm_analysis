@@ -12,10 +12,10 @@ from flask import Flask, jsonify, render_template, request
 from flask_cors import CORS
 
 
-# Allow `flask --app app run` from tracelens/ and direct execution from repo root.
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+# Ensure the app's own directory is on the path so traffic_llm_pipeline is importable.
+APP_DIR = Path(__file__).resolve().parent
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
 
 # The shared pipeline imports Matplotlib for CLI plot saving. Give it a writable
 # cache path when the Flask app imports the module in sandboxed environments.
@@ -185,7 +185,6 @@ def upload():
         return jsonify({"sessions": info})
     except Exception as e:
         import traceback
-
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
     finally:
@@ -225,7 +224,6 @@ def analyze():
         })
     except Exception as e:
         import traceback
-
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
